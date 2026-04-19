@@ -20,16 +20,12 @@ import redis
 
 QUEUE = "bench"
 
-# Параметры тестов
-SIZES = [128, 1024, 10240, 102400]   # байт: 128B, 1KB, 10KB, 100KB
-RATES = [1000, 5000, 10000]          # msg/sec
-DURATION = 20                         # секунд на каждый тест
+SIZES = [128, 1024, 10240, 102400]
+RATES = [1000, 5000, 10000]
+DURATION = 20
 
-
-# ─── Consumer-поток ───────────────────────────────────────────────────────────
 
 class ConsumerStats:
-    """Хранит результаты consumer: число сообщений и список latency"""
     def __init__(self):
         self.received = 0
         self.latencies = []   # список задержек в мс
@@ -37,7 +33,6 @@ class ConsumerStats:
 
 
 def redis_consumer(stats: ConsumerStats):
-    """Читает из Redis пока не выставлен флаг done + очередь пуста"""
     r = redis.Redis(host='localhost', port=6379)
     while not stats.done or r.llen(QUEUE) > 0:
         result = r.blpop(QUEUE, timeout=1)
@@ -51,7 +46,6 @@ def redis_consumer(stats: ConsumerStats):
 
 
 def rabbit_consumer(stats: ConsumerStats):
-    """Читает из RabbitMQ пока не выставлен флаг done + очередь пуста"""
     conn = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     ch = conn.channel()
     ch.queue_declare(queue=QUEUE)
@@ -78,13 +72,8 @@ def rabbit_consumer(stats: ConsumerStats):
     conn.close()
 
 
-# ─── Producer ─────────────────────────────────────────────────────────────────
 
 def run_test(broker: str, msg_size: int, target_rate: int) -> dict:
-    """
-    Один прогон теста.
-    Возвращает словарь с результатами.
-    """
     payload = "x" * msg_size       # payload нужного размера
     interval = 1.0 / target_rate   # пауза между сообщениями для throttling
     stats = ConsumerStats()
@@ -157,10 +146,8 @@ def run_test(broker: str, msg_size: int, target_rate: int) -> dict:
     }
 
 
-# ─── Точка входа ──────────────────────────────────────────────────────────────
 
 def clear_queues():
-    """Очищаем очереди перед каждым тестом чтобы не было мусора"""
     try:
         r = redis.Redis(host='localhost', port=6379)
         r.delete(QUEUE)
