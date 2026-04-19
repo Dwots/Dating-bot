@@ -1,4 +1,5 @@
 services:
+
   postgres:
     image: postgres:16-alpine
     container_name: dating_bot_db
@@ -16,6 +17,72 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: dating_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    # redis-cli ping возвращает PONG если всё ок
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: dating_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"    # порт для подключения приложений (AMQP протокол)
+      - "15672:15672"  # порт веб-интерфейса (Management UI)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: dating_minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # server /data — папка где хранятся файлы
+    # --console-address — на каком порту веб-интерфейс
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API (сюда обращается boto3)
+      - "9001:9001"   # веб-интерфейс MinIO
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    container_name: dating_surreal
+    # --user, --pass — логин/пароль
+    # --bind — на каком адресе слушать
+    # memory — хранить данные в памяти (для прода нужен file:// или tikv://)
+    command: start --user root --pass root --bind 0.0.0.0:8000 memory
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
   bot:
     build:
       context: ./bot
@@ -28,10 +95,27 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: dating_bot
+      # новые переменные — имена сервисов внутри docker-сети
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_USER: root
+      SURREAL_PASS: root
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      # minio и surrealdb пока не ждём — бот их ещё не использует
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:
+  rabbitmq_data:
+  minio_data:
