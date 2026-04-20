@@ -1,17 +1,3 @@
-"""
-Запуск:
-  pip install pika redis
-  docker-compose up -d
-  python benchmark.py
-
-Что делает:
-  - прогоняет тесты для RabbitMQ и Redis
-  - разные размеры сообщений: 128B, 1KB, 10KB, 100KB
-  - разные нагрузки: 1000, 5000, 10000 msg/s
-  - считает: скорость, latency avg/p95/max, потери
-  - печатает итоговую таблицу
-"""
-
 import time
 import json
 import threading
