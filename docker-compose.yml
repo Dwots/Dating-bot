@@ -104,6 +104,8 @@ services:
       SURREAL_URL: ws://surrealdb:8000/rpc
       SURREAL_USER: root
       SURREAL_PASS: root
+    ports:
+      - "8001:8001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -114,8 +116,119 @@ services:
       # minio и surrealdb пока не ждём — бот их ещё не использует
     restart: unless-stopped
 
+    # Celery воркер — выполняет задачи
+  celery_worker:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: dating_celery_worker
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: dating_bot
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    # запускаем воркер на двух очередях
+    command: celery -A celery_app worker --loglevel=info -Q ratings,notifications
+
+  # Celery Beat — планировщик расписания
+  celery_beat:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: dating_celery_beat
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: dating_bot
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - celery_worker
+    restart: unless-stopped
+    command: celery -A celery_app beat --loglevel=info
+
+  # Consumer — слушает очередь match и триггерит уведомления
+  match_consumer:
+    build:
+      context: ./workers
+      dockerfile: Dockerfile
+    container_name: dating_match_consumer
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: dating_bot
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      celery_worker:
+        condition: service_started
+    restart: unless-stopped
+    command: python consumer.py
+
+    # Prometheus — сбор метрик
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dating_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+
+  # Grafana — визуализация метрик
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dating_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+  
+  benchmark:
+    build:
+      context: ./task2
+      dockerfile: Dockerfile
+    container_name: dating_benchmark
+    depends_on:
+      - bot
+      - prometheus
+    network_mode: host  # чтобы видеть localhost:8001
+    profiles:
+      - test  # запускается только с флагом --profile test
+
 volumes:
   postgres_data:
   redis_data:
   rabbitmq_data:
   minio_data:
+  prometheus_data:
+  grafana_data:

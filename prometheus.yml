@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'bot'
+    static_configs:
+      - targets: ['bot:8001']   # ← было 8000, меняем на 8001

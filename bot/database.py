@@ -103,3 +103,25 @@ class Database:
     async def get_session(self) -> AsyncSession:
         async with self.session_factory() as session:
             return session
+
+
+class Referral(Base):
+    __tablename__ = "referrals"
+
+    id = Column(BigInteger, primary_key=True)
+    # кто пригласил
+    referrer_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    # кого пригласили
+    referred_id = Column(BigInteger, ForeignKey("users.id"), unique=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Photo(Base):
+    __tablename__ = "photos"
+
+    id = Column(BigInteger, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    # s3_key — путь к файлу в MinIO, например "photos/123456/abc.jpg"
+    # по нему мы потом достаём файл обратно
+    s3_key = Column(String(500), nullable=False)
+    is_primary = Column(Boolean, default=False)  # главное фото профиля
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
