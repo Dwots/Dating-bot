@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Статистика - Admin Panel</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        nav a { margin-right: 20px; text-decoration: none; color: #007bff; }
+        table { width: 100%; background: white; border-radius: 8px; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f9f9f9; }
+        h2 { margin-top: 30px; }
+        .activity-bar { 
+            background: #007bff; 
+            height: 20px; 
+            border-radius: 3px;
+            min-width: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛠 Admin Panel - Dating Bot</h1>
+            <nav>
+                <a href="/">Статистика</a>
+                <a href="/users">Пользователи</a>
+                <a href="/stats">Подробная статистика</a>
+            </nav>
+        </div>
+
+        <h2>🏆 TOP-10 по рейтингу</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Имя</th>
+                    <th>Возраст</th>
+                    <th>Город</th>
+                    <th>Primary</th>
+                    <th>Behavioral</th>
+                    <th>Combined</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user, profile, rating in top_users %}
+                <tr>
+                    <td>{{ loop.index }}</td>
+                    <td>{{ profile.name or "—" }}</td>
+                    <td>{{ profile.age or "—" }}</td>
+                    <td>{{ profile.city or "—" }}</td>
+                    <td>{{ "%.3f"|format(rating.primary_score) }}</td>
+                    <td>{{ "%.3f"|format(rating.behavioral_score) }}</td>
+                    <td><strong>{{ "%.3f"|format(rating.combined_score) }}</strong></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <h2>📊 Активность за 7 дней</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Дата</th>
+                    <th>Взаимодействий</th>
+                    <th>График</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for day in activity %}
+                <tr>
+                    <td>{{ day.date }}</td>
+                    <td>{{ day.count }}</td>
+                    <td>
+                        <div class="activity-bar" 
+                             style="width: {{ [day.count * 2, 300] | min }}px">
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>

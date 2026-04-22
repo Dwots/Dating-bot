@@ -225,6 +225,24 @@ services:
     profiles:
       - test  # запускается только с флагом --profile test
 
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    container_name: dating_admin
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: dating_bot
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:

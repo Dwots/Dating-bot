@@ -83,6 +83,40 @@ async def main():
     async def surreal_middleware(handler, event, data):
         data["surreal"] = surreal
         return await handler(event, data)
+    
+
+    @dp.update.middleware()
+    async def ban_check_middleware(handler, event, data):
+        """
+        Проверяем бан для каждого апдейта.
+        Если пользователь забанен — не обрабатываем.
+        """
+        from aiogram.types import Update, Message, CallbackQuery
+        from sqlalchemy import select as sa_select
+
+        user_id = None
+        if isinstance(event, Update):
+            if event.message:
+                user_id = event.message.from_user.id
+            elif event.callback_query:
+                user_id = event.callback_query.from_user.id
+
+        if user_id and "session" in data:
+            session = data["session"]
+            from database import User as UserModel
+            result = await session.execute(
+                sa_select(UserModel).where(UserModel.telegram_id == user_id)
+            )
+            user = result.scalar_one_or_none()
+
+            if user and user.is_banned:
+                if isinstance(event, Update) and event.callback_query:
+                    await event.callback_query.answer(
+                        "🚫 Ваш аккаунт заблокирован", show_alert=True
+                    )
+                return  # не передаём дальше
+
+        return await handler(event, data)
 
     dp.update.middleware(RateLimitMiddleware(redis_client))
 
@@ -92,7 +126,7 @@ async def main():
     finally:
         await rabbitmq.close()
         await surreal.close()
-
+        
 
 if __name__ == "__main__":
     asyncio.run(main())

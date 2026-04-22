@@ -99,11 +99,18 @@ def calculate_completeness(profile: Profile) -> float:
 @router.message(CommandStart())
 async def cmd_start(message: Message, session: AsyncSession):
     REQUESTS_TOTAL.labels(handler="start").inc()
-    
-    user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-    
+
+    user = await get_or_create_user(
+        session, message.from_user.id, message.from_user.username
+    )
+
+    # Проверяем бан
+    if user.is_banned:
+        await message.answer("🚫 Ваш аккаунт заблокирован.")
+        return
+
     logger.info("user_started", user_id=user.telegram_id, username=user.username)
-    
+
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("ref_"):
         await process_referral(session, user, args[1])
@@ -114,7 +121,7 @@ async def cmd_start(message: Message, session: AsyncSession):
         "Заполни анкету, чтобы начать знакомиться!",
         reply_markup=main_menu_kb()
     )
-
+    
 
 async def process_referral(session: AsyncSession, new_user: User, ref_code: str):
     """

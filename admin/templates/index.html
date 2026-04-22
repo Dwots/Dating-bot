@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Panel - Dating Bot</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+        .stat-card { background: white; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-card h2 { margin: 0; color: #555; font-size: 3em; }
+        .stat-card p { margin: 10px 0 0 0; color: #999; }
+        nav { margin: 20px 0; }
+        nav a { margin-right: 20px; text-decoration: none; color: #007bff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛠 Admin Panel - Dating Bot</h1>
+            <nav>
+                <a href="/">Статистика</a>
+                <a href="/users">Пользователи</a>
+                <a href="/stats">Подробная статистика</a>
+            </nav>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h2>{{ total_users }}</h2>
+                <p>Всего пользователей</p>
+            </div>
+            <div class="stat-card">
+                <h2>{{ active_users }}</h2>
+                <p>Активных (24ч)</p>
+            </div>
+            <div class="stat-card">
+                <h2>{{ total_matches }}</h2>
+                <p>Всего мэтчей</p>
+            </div>
+            <div class="stat-card">
+                <h2>{{ likes_today }}</h2>
+                <p>Лайков сегодня</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
