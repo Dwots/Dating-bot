@@ -18,16 +18,6 @@ def profile_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def edit_profile_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📛 Имя", callback_data="edit_name")],
-        [InlineKeyboardButton(text="🎂 Возраст", callback_data="edit_age")],
-        [InlineKeyboardButton(text="⚧ Пол", callback_data="edit_gender")],
-        [InlineKeyboardButton(text="🏙 Город", callback_data="edit_city")],
-        [InlineKeyboardButton(text="📝 О себе", callback_data="edit_description")],
-        [InlineKeyboardButton(text="💡 Интересы", callback_data="edit_interests")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_profile")],
-    ])
 
 
 def gender_kb() -> InlineKeyboardMarkup:

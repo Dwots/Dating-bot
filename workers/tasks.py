@@ -238,7 +238,7 @@ def notify_match(user1_telegram_id: int, user2_telegram_id: int, user1_name: str
             f"🎉 У вас новый мэтч с {user1_name}!\n\nНачните общение!"
         )
 
-        logger.info(f"Match notifications sent successfully")
+        logger.info("Match notifications sent successfully")
 
     except Exception as e:
         logger.error(f"Error sending match notification: {e}")

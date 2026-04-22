@@ -962,9 +962,10 @@ async def show_matches(callback: CallbackQuery, session: AsyncSession):
                 Match.user1_id == current_user.id,
                 Match.user2_id == current_user.id
             ),
-            Match.is_active == True
+            Match.is_active.is_(True)
         )
     )
+    
     matches = matches_result.scalars().all()
 
     if matches:
