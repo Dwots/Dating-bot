@@ -1,9 +1,19 @@
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
 .env
-*.log
-.idea/
+venv/
+.venv/
+
+# Docker / Local data
+postgres_data/
+redis_data/
+minio_data/
+surreal_data/
+grafana_data/
+prometheus_data/
+
+# IDE
 .vscode/
-*.sqlite3
-.DS_Store
+.idea/
