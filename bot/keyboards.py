@@ -70,6 +70,6 @@ def edit_profile_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏙 Город", callback_data="edit_city")],
         [InlineKeyboardButton(text="📝 О себе", callback_data="edit_description")],
         [InlineKeyboardButton(text="💡 Интересы", callback_data="edit_interests")],
-        [InlineKeyboardButton(text="📷 Фото", callback_data="edit_photo")],   # ← новая
+        [InlineKeyboardButton(text="📷 Фото", callback_data="edit_photo")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_profile")],
     ])

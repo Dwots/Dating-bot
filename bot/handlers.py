@@ -701,7 +701,7 @@ async def _fetch_profiles_from_db(
     current_user: User,
     redis: aioredis.Redis,
     cache_key: str,
-    surreal: SurrealClient,        # ← добавили
+    surreal: SurrealClient,
 ) -> dict | None:
     pref_result = await session.execute(
         select(Preference).where(Preference.user_id == current_user.id)
@@ -831,7 +831,7 @@ async def like_profile(
     rabbitmq: RabbitMQClient,
     minio: MinioClient,
     redis: aioredis.Redis,
-    surreal: SurrealClient,        # ← добавили
+    surreal: SurrealClient,
 ):
     data = await state.get_data()
     viewing_user_id = data.get("viewing_user_id")
@@ -911,7 +911,7 @@ async def skip_profile(
     rabbitmq: RabbitMQClient,
     minio: MinioClient,
     redis: aioredis.Redis,
-    surreal: SurrealClient,        # ← добавили
+    surreal: SurrealClient,
 ):
     data = await state.get_data()
     viewing_user_id = data.get("viewing_user_id")

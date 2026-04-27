@@ -23,7 +23,6 @@ async def main():
         logger.error("bot_token_missing")
         return
 
-    # Просто вызываем функцию — она сама запускает поток
     start_metrics_server(port=8001)
 
     db = Database(config.database_url)
