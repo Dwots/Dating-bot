@@ -19,6 +19,7 @@ class Config:
     surreal_url: str
     surreal_user: str
     surreal_pass: str
+    telegram_proxy: str | None
 
     @property
     def database_url(self) -> str:
@@ -45,4 +46,5 @@ def load_config() -> Config:
         surreal_url=os.environ.get("SURREAL_URL", "ws://localhost:8000/rpc"),
         surreal_user=os.environ.get("SURREAL_USER", "root"),
         surreal_pass=os.environ.get("SURREAL_PASS", "root"),
+        telegram_proxy=os.environ.get("TELEGRAM_PROXY") or None,
     )

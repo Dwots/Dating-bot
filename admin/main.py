@@ -1,16 +1,17 @@
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
-from sqlalchemy import create_engine, select, func, text
+from fastapi.responses import RedirectResponse, StreamingResponse
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker, Session
 import os
+import io
+import boto3
 from datetime import datetime, timedelta
 
 # Импортируем модели из bot (Docker volume или копируем)
 import sys
 sys.path.append("/bot")
-from database import User, Profile, Match, Interaction, Rating, Base
+from database import User, Profile, Match, Interaction, Rating, Photo
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -26,6 +27,19 @@ DB_URL = (
 )
 engine = create_engine(DB_URL)
 SessionLocal = sessionmaker(bind=engine)
+
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "profiles")
+
+s3_client = boto3.client(
+    "s3",
+    endpoint_url=f"http://{MINIO_ENDPOINT}",
+    aws_access_key_id=MINIO_ACCESS_KEY,
+    aws_secret_access_key=MINIO_SECRET_KEY,
+    region_name="us-east-1",
+)
 
 
 def get_db() -> Session:
@@ -68,7 +82,17 @@ async def users_list(request: Request):
     """Список пользователей с кнопками Ban/Unban"""
     db = get_db()
     
-    users = db.query(User, Profile).join(Profile, User.id == Profile.user_id).all()
+    rows = db.query(User, Profile).join(Profile, User.id == Profile.user_id).all()
+    users = []
+    for user, profile in rows:
+        primary_photo = db.query(Photo).filter(
+            Photo.user_id == user.id,
+        ).order_by(
+            Photo.is_primary.desc(),
+            Photo.created_at.asc(),
+            Photo.id.asc(),
+        ).first()
+        users.append((user, profile, primary_photo))
     
     db.close()
     
@@ -76,6 +100,22 @@ async def users_list(request: Request):
         "request": request,
         "users": users,
     })
+
+
+@app.get("/photos/{photo_id}")
+async def photo_preview(photo_id: int):
+    """Отдаём фото из MinIO для превью в админке."""
+    db = get_db()
+    photo = db.query(Photo).filter(Photo.id == photo_id).first()
+    db.close()
+
+    if not photo:
+        return RedirectResponse(url="/users", status_code=303)
+
+    response = s3_client.get_object(Bucket=MINIO_BUCKET, Key=photo.s3_key)
+    content = response["Body"].read()
+    content_type = response.get("ContentType") or "image/jpeg"
+    return StreamingResponse(io.BytesIO(content), media_type=content_type)
 
 
 @app.post("/users/{user_id}/ban")

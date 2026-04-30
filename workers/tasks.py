@@ -18,6 +18,7 @@ DB_URL = (
     f"{os.environ.get('DB_NAME', 'dating_bot')}"
 )
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY") or None
 
 # Celery задачи синхронные — используем обычный psycopg2
 # (не asyncpg как в боте)
@@ -205,40 +206,34 @@ def _calculate_user_rating(session: Session, user_id: int, user_row) -> dict:
 @app.task(name="tasks.notify_match")
 def notify_match(user1_telegram_id: int, user2_telegram_id: int, user1_name: str):
     """
-    Получает данные матча и отправляет уведомления обоим пользователям
-    через Telegram Bot API.
+    Получает данные матча и отправляет push-уведомление второму пользователю.
+    Первый пользователь уже получает сообщение прямо в карточке, где нажал лайк.
 
     Вызывается из consumer который слушает очередь "match" в RabbitMQ.
     
     Используем requests (синхронный HTTP) потому что Celery задачи синхронные.
     Bot API endpoint: POST https://api.telegram.org/bot{TOKEN}/sendMessage
     """
-    logger.info(f"Sending match notification: {user1_telegram_id} ↔ {user2_telegram_id}")
+    logger.info(f"Sending match notification to {user2_telegram_id}")
 
     session = get_session()
     try:
-        # Получаем имя второго пользователя для уведомления первому
-        user2_profile = session.execute(text("""
-            SELECT p.name FROM profiles p
-            JOIN users u ON u.id = p.user_id
+        # Получаем контакт первого пользователя для уведомления второму
+        user1_profile = session.execute(text("""
+            SELECT u.username FROM users u
             WHERE u.telegram_id = :tg_id
-        """), {"tg_id": user2_telegram_id}).fetchone()
+        """), {"tg_id": user1_telegram_id}).fetchone()
 
-        user2_name = user2_profile.name if user2_profile and user2_profile.name else "Пользователь"
-
-        # Отправляем уведомление первому пользователю
-        _send_telegram_message(
-            user1_telegram_id,
-            f"🎉 У вас новый мэтч с {user2_name}!\n\nНачните общение!"
-        )
+        user1_contact = f"@{user1_profile.username}" if user1_profile and user1_profile.username else "тег не указан"
 
         # Отправляем уведомление второму пользователю
         _send_telegram_message(
             user2_telegram_id,
-            f"🎉 У вас новый мэтч с {user1_name}!\n\nНачните общение!"
+            f"🎉 У вас новый мэтч с {user1_name}!\n\nКуда писать: {user1_contact}",
+            reply_markup=main_menu_reply_markup(),
         )
 
-        logger.info("Match notifications sent successfully")
+        logger.info("Match notification sent successfully")
 
     except Exception as e:
         logger.error(f"Error sending match notification: {e}")
@@ -247,16 +242,39 @@ def notify_match(user1_telegram_id: int, user2_telegram_id: int, user1_name: str
         session.close()
 
 
-def _send_telegram_message(telegram_id: int, text: str):
+def main_menu_reply_markup() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "👤 Моя анкета", "callback_data": "my_profile"}],
+            [{"text": "💕 Смотреть анкеты", "callback_data": "view_profiles"}],
+            [{"text": "❤️ Мои мэтчи", "callback_data": "my_matches"}],
+            [{"text": "⚙️ Настройки поиска", "callback_data": "search_settings"}],
+            [{"text": "👥 Пригласить друга", "callback_data": "referral"}],
+        ]
+    }
+
+
+def _send_telegram_message(telegram_id: int, text: str, reply_markup: dict | None = None):
     """
     Отправляем сообщение через Telegram Bot API напрямую (HTTP запрос)
     Не используем aiogram — он асинхронный, а мы в синхронном Celery
     """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    response = requests.post(url, json={
+    proxies = None
+    if TELEGRAM_PROXY:
+        proxies = {
+            "http": TELEGRAM_PROXY,
+            "https": TELEGRAM_PROXY,
+        }
+
+    payload = {
         "chat_id": telegram_id,
         "text": text,
-    }, timeout=10)
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    response = requests.post(url, json=payload, timeout=10, proxies=proxies)
 
     if not response.ok:
         logger.error(f"Telegram API error: {response.text}")

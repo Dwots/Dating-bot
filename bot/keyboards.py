@@ -53,6 +53,18 @@ def back_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def photo_management_kb(photos) -> InlineKeyboardMarkup:
+    buttons = []
+    for index, photo in enumerate(photos, 1):
+        label = f"🗑 Удалить фото {index}"
+        if photo.is_primary:
+            label += " ⭐"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"delete_photo_{photo.id}")])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="edit_profile")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def search_settings_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚧ Кого ищу", callback_data="edit_search_gender")],

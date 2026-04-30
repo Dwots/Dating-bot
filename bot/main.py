@@ -1,6 +1,8 @@
 import asyncio
 import redis.asyncio as aioredis
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import load_config
@@ -51,7 +53,8 @@ async def main():
     )
     await surreal.connect()
 
-    bot = Bot(token=config.bot_token)
+    telegram_session = AiohttpSession(proxy=config.telegram_proxy)
+    bot = Bot(token=config.bot_token, session=telegram_session)
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
@@ -119,10 +122,25 @@ async def main():
 
     dp.update.middleware(RateLimitMiddleware(redis_client))
 
+    if config.telegram_proxy:
+        logger.info("telegram_proxy_enabled")
+
     logger.info("bot_starting")
     try:
-        await dp.start_polling(bot)
+        while True:
+            try:
+                await dp.start_polling(bot)
+            except TelegramNetworkError as exc:
+                logger.warning(
+                    "telegram_network_error_retry",
+                    error=str(exc),
+                    retry_in_seconds=15,
+                )
+                await asyncio.sleep(15)
+            else:
+                break
     finally:
+        await bot.session.close()
         await rabbitmq.close()
         await surreal.close()
         

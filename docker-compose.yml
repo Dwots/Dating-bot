@@ -90,6 +90,7 @@ services:
     container_name: dating_bot
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: postgres
@@ -104,8 +105,11 @@ services:
       SURREAL_URL: ws://surrealdb:8000/rpc
       SURREAL_USER: root
       SURREAL_PASS: root
+      MINIO_BUCKET: profiles
     ports:
       - "8001:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,7 +117,10 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      # minio и surrealdb пока не ждём — бот их ещё не использует
+      minio:
+        condition: service_healthy
+      surrealdb:
+        condition: service_started
     restart: unless-stopped
 
     # Celery воркер — выполняет задачи
@@ -124,6 +131,7 @@ services:
     container_name: dating_celery_worker
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: postgres
@@ -138,9 +146,11 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     # запускаем воркер на двух очередях
-    command: celery -A celery_app worker --loglevel=info -Q ratings,notifications
+    command: celery -A celery_app worker --loglevel=info -Q celery,ratings,notifications
 
   # Celery Beat — планировщик расписания
   celery_beat:
@@ -150,6 +160,7 @@ services:
     container_name: dating_celery_beat
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: postgres
@@ -159,6 +170,8 @@ services:
       REDIS_URL: redis://redis:6379/0
     depends_on:
       - celery_worker
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     command: celery -A celery_app beat --loglevel=info
 
@@ -170,6 +183,7 @@ services:
     container_name: dating_match_consumer
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: postgres
@@ -182,6 +196,8 @@ services:
         condition: service_healthy
       celery_worker:
         condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     command: python consumer.py
 
@@ -215,7 +231,7 @@ services:
   
   benchmark:
     build:
-      context: ./task2
+      context: ./benchmark
       dockerfile: Dockerfile
     container_name: dating_benchmark
     depends_on:
@@ -227,8 +243,8 @@ services:
 
   admin:
     build:
-      context: ./admin
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: admin/Dockerfile
     container_name: dating_admin
     environment:
       DB_HOST: postgres
@@ -236,10 +252,16 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: dating_bot
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: profiles
     ports:
       - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     restart: unless-stopped
 

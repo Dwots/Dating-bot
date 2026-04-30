@@ -4,7 +4,7 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from rabbitmq import RabbitMQClient
 from minio_client import MinioClient
@@ -20,7 +20,8 @@ logger = setup_logging("handlers")
 from database import User, Profile, Preference, Match, Interaction, Rating, Referral, Gender, Photo
 from keyboards import (
     main_menu_kb, profile_menu_kb, edit_profile_kb, gender_kb,
-    search_gender_kb, view_profile_kb, back_kb, search_settings_kb
+    search_gender_kb, view_profile_kb, back_kb, search_settings_kb,
+    photo_management_kb
 )
 
 router = Router()
@@ -69,6 +70,10 @@ async def get_or_create_user(session: AsyncSession, telegram_id: int, username: 
 
         await session.commit()
 
+    elif user.username != username:
+        user.username = username
+        await session.commit()
+
     return user
 
 
@@ -92,6 +97,63 @@ def calculate_completeness(profile: Profile) -> float:
     if profile.photo_count and profile.photo_count > 0:
         filled += 1
     return filled / 7
+
+
+async def replace_message_text(callback: CallbackQuery, text: str, reply_markup=None):
+    """
+    Inline-кнопки могут висеть как на обычном сообщении, так и на фото с caption.
+    Telegram не даёт заменить photo-message через edit_text, поэтому в этом
+    случае удаляем старое сообщение и отправляем новое.
+    """
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(text, reply_markup=reply_markup)
+
+
+async def get_primary_photo(session: AsyncSession, user_id: int) -> Photo | None:
+    """
+    Берём одну главную фотографию даже если из-за параллельной загрузки
+    в БД случайно оказалось несколько is_primary=True.
+    """
+    result = await session.execute(
+        select(Photo)
+        .where(Photo.user_id == user_id)
+        .order_by(Photo.is_primary.desc(), Photo.created_at.asc(), Photo.id.asc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_user_photos(session: AsyncSession, user_id: int) -> list[Photo]:
+    result = await session.execute(
+        select(Photo)
+        .where(Photo.user_id == user_id)
+        .order_by(Photo.is_primary.desc(), Photo.created_at.asc(), Photo.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def update_profile_photo_stats(session: AsyncSession, user_id: int):
+    photos = await get_user_photos(session, user_id)
+    profile_result = await session.execute(
+        select(Profile).where(Profile.user_id == user_id)
+    )
+    profile = profile_result.scalar_one_or_none()
+    if profile:
+        profile.photo_count = len(photos)
+        profile.completeness = calculate_completeness(profile)
+    return photos
+
+
+def format_telegram_contact(user: User | None) -> str:
+    if user and user.username:
+        return f"@{user.username}"
+    return "тег не указан"
 
 
 # ─── /start — с поддержкой реферальной ссылки ────────────────────────────────
@@ -163,9 +225,10 @@ async def process_referral(session: AsyncSession, new_user: User, ref_code: str)
 
 @router.callback_query(F.data == "main_menu")
 async def show_main_menu(callback: CallbackQuery):
-    await callback.message.edit_text(
+    await replace_message_text(
+        callback,
         "📱 Главное меню\n\nВыбери действие:",
-        reply_markup=main_menu_kb()
+        main_menu_kb()
     )
     await callback.answer()
 
@@ -173,7 +236,7 @@ async def show_main_menu(callback: CallbackQuery):
 # ─── Профиль ──────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "my_profile")
-async def show_profile(callback: CallbackQuery, session: AsyncSession):
+async def show_profile(callback: CallbackQuery, session: AsyncSession, minio: MinioClient):
     result = await session.execute(
         select(Profile).join(User).where(User.telegram_id == callback.from_user.id)
     )
@@ -194,15 +257,40 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession):
     else:
         text = "Анкета не найдена. Начни с /start"
 
-    await callback.message.edit_text(text, reply_markup=profile_menu_kb())
+    if profile:
+        primary_photo = await get_primary_photo(session, profile.user_id)
+
+        if primary_photo:
+            loop = asyncio.get_event_loop()
+            photo_bytes = await loop.run_in_executor(
+                None, minio.get_photo_bytes, primary_photo.s3_key
+            )
+            photo_file = BufferedInputFile(photo_bytes, filename="profile.jpg")
+
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+
+            await callback.message.answer_photo(
+                photo=photo_file,
+                caption=text,
+                reply_markup=profile_menu_kb(),
+            )
+            await callback.answer()
+            return
+
+    await replace_message_text(callback, text, profile_menu_kb())
     await callback.answer()
 
 
 @router.callback_query(F.data == "edit_profile")
-async def edit_profile_menu(callback: CallbackQuery):
-    await callback.message.edit_text(
+async def edit_profile_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await replace_message_text(
+        callback,
         "✏️ Что хочешь изменить?",
-        reply_markup=edit_profile_kb()
+        edit_profile_kb()
     )
     await callback.answer()
 
@@ -343,14 +431,22 @@ async def process_interests(message: Message, state: FSMContext, session: AsyncS
 # ─── Фото ─────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "edit_photo")
-async def edit_photo(callback: CallbackQuery, state: FSMContext):
+async def edit_photo(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     await state.set_state(ProfileForm.photo)
-    await callback.message.edit_text(
-        "📷 Отправь фото для профиля\n\n"
-        "Требования:\n"
-        "• Только фото (не документ)\n"
-        "• Максимум 5 фото на профиль",
-        reply_markup=back_kb()
+
+    user_result = await session.execute(
+        select(User).where(User.telegram_id == callback.from_user.id)
+    )
+    current_user = user_result.scalar_one_or_none()
+    photos = await get_user_photos(session, current_user.id) if current_user else []
+
+    await replace_message_text(
+        callback,
+        "📷 Фото профиля\n\n"
+        f"Загружено: {len(photos)}/5\n\n"
+        "Можно отправить одно фото или альбом из нескольких фото. "
+        "Первое загруженное фото будет главным.",
+        photo_management_kb(photos)
     )
     await callback.answer()
 
@@ -368,6 +464,16 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
     )
     current_user = user_result.scalar_one_or_none()
 
+    if not current_user:
+        await message.answer("Сначала зарегистрируйся с /start")
+        await state.clear()
+        return
+
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": current_user.id},
+    )
+
     # Проверяем сколько фото уже загружено
     photos_result = await session.execute(
         select(Photo).where(Photo.user_id == current_user.id)
@@ -375,11 +481,12 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
     existing_photos = photos_result.scalars().all()
 
     if len(existing_photos) >= 5:
+        photos = await get_user_photos(session, current_user.id)
         await message.answer(
             "❌ Максимум 5 фото. Удали старое чтобы добавить новое.",
-            reply_markup=main_menu_kb()
+            reply_markup=photo_management_kb(photos)
         )
-        await state.clear()
+        await session.rollback()
         return
 
     # Скачиваем фото из Telegram
@@ -401,8 +508,15 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
         current_user.telegram_id
     )
 
-    # Первое фото — главное
-    is_primary = len(existing_photos) == 0
+    # Первое фото — главное.
+    is_primary = not any(photo.is_primary for photo in existing_photos)
+
+    if is_primary:
+        await session.execute(
+            update(Photo)
+            .where(Photo.user_id == current_user.id)
+            .values(is_primary=False)
+        )
 
     # Сохраняем метаданные в PostgreSQL
     # Сам файл в MinIO, в БД только путь к нему
@@ -412,24 +526,98 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
         is_primary=is_primary
     )
     session.add(photo_record)
+    await session.flush()
 
-    # Обновляем счётчик фото в профиле
-    profile_result = await session.execute(
-        select(Profile).where(Profile.user_id == current_user.id)
-    )
-    profile = profile_result.scalar_one_or_none()
-    if profile:
-        profile.photo_count = len(existing_photos) + 1
-        profile.completeness = calculate_completeness(profile)
-
+    photos = await update_profile_photo_stats(session, current_user.id)
     await session.commit()
-    await state.clear()
 
     await message.answer(
         f"✅ Фото загружено! {'(главное фото профиля)' if is_primary else ''}\n"
-        f"Всего фото: {len(existing_photos) + 1}/5",
-        reply_markup=main_menu_kb()
+        f"Всего фото: {len(photos)}/5\n\n"
+        "Можно отправить ещё фото или удалить лишние ниже.",
+        reply_markup=photo_management_kb(photos)
     )
+
+
+@router.callback_query(F.data.startswith("delete_photo_"))
+async def delete_photo(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    minio: MinioClient,
+):
+    await state.set_state(ProfileForm.photo)
+
+    try:
+        photo_id = int(callback.data.replace("delete_photo_", ""))
+    except ValueError:
+        await callback.answer("Некорректное фото", show_alert=True)
+        return
+
+    user_result = await session.execute(
+        select(User).where(User.telegram_id == callback.from_user.id)
+    )
+    current_user = user_result.scalar_one_or_none()
+    if not current_user:
+        await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
+        return
+
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": current_user.id},
+    )
+
+    photo_result = await session.execute(
+        select(Photo).where(
+            Photo.id == photo_id,
+            Photo.user_id == current_user.id,
+        )
+    )
+    photo = photo_result.scalar_one_or_none()
+    if not photo:
+        photos = await get_user_photos(session, current_user.id)
+        await session.rollback()
+        await replace_message_text(
+            callback,
+            f"📷 Фото профиля\n\nЗагружено: {len(photos)}/5",
+            photo_management_kb(photos)
+        )
+        await callback.answer("Фото уже удалено")
+        return
+
+    was_primary = bool(photo.is_primary)
+    s3_key = photo.s3_key
+
+    await session.delete(photo)
+    await session.flush()
+
+    remaining_photos = await get_user_photos(session, current_user.id)
+    if remaining_photos and (was_primary or not any(p.is_primary for p in remaining_photos)):
+        await session.execute(
+            update(Photo)
+            .where(Photo.user_id == current_user.id)
+            .values(is_primary=False)
+        )
+        remaining_photos[0].is_primary = True
+        await session.flush()
+
+    photos = await update_profile_photo_stats(session, current_user.id)
+    await session.commit()
+
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, minio.delete_photo, s3_key)
+    except Exception as exc:
+        logger.warning("minio_photo_delete_failed", photo_id=photo_id, error=str(exc))
+
+    await replace_message_text(
+        callback,
+        "🗑 Фото удалено.\n\n"
+        f"Загружено: {len(photos)}/5\n\n"
+        "Можно отправить ещё фото или удалить лишние ниже.",
+        photo_management_kb(photos)
+    )
+    await callback.answer()
 
 
 @router.message(ProfileForm.photo)
@@ -655,8 +843,17 @@ async def view_profiles(
 
     if cached:
         profile_data = json.loads(cached)
-        CACHE_HITS.inc()  # метрика
-        logger.info("cache_hit", user_id=current_user.id)
+        excluded_ids = await get_excluded_profile_ids(session, current_user, surreal)
+        if profile_data["user_id"] in excluded_ids:
+            CACHE_MISSES.inc()
+            logger.info("cache_stale", user_id=current_user.id)
+            await redis.delete(cache_key)
+            profile_data = await _fetch_profiles_from_db(
+                session, current_user, redis, cache_key, surreal
+            )
+        else:
+            CACHE_HITS.inc()  # метрика
+            logger.info("cache_hit", user_id=current_user.id)
     else:
         CACHE_MISSES.inc()  # метрика
         logger.info("cache_miss", user_id=current_user.id)
@@ -665,9 +862,10 @@ async def view_profiles(
         )
 
     if not profile_data:
-        await callback.message.edit_text(
+        await replace_message_text(
+            callback,
             "😔 Пока нет подходящих анкет.\n\nПопробуй изменить настройки поиска!",
-            reply_markup=back_kb()
+            back_kb()
         )
         await callback.answer()
         return
@@ -708,21 +906,14 @@ async def _fetch_profiles_from_db(
     )
     pref = pref_result.scalar_one_or_none()
 
-    # Получаем просмотренных из SurrealDB (граф)
-    # Раньше: запрос в PostgreSQL SELECT to_user_id FROM interactions WHERE from_user_id = X
-    # Теперь: обход графа — быстрее
-    interacted_ids = await surreal.get_interacted_users(current_user.id)
-    
-    # Преобразуем в список для SQLAlchemy not_in
-    viewed_ids = list(interacted_ids)
-    viewed_ids.append(current_user.id)
+    excluded_ids = await get_excluded_profile_ids(session, current_user, surreal)
 
     query = (
         select(Profile)
         .join(User)
         .join(Rating, User.id == Rating.user_id)
         .where(
-            Profile.user_id.not_in(viewed_ids),
+            Profile.user_id.not_in(excluded_ids),
             Profile.completeness > 0.3,
         )
     )
@@ -768,6 +959,47 @@ async def _fetch_profiles_from_db(
     return all_dicts[0]
 
 
+async def get_excluded_profile_ids(
+    session: AsyncSession,
+    current_user: User,
+    surreal: SurrealClient,
+) -> list[int]:
+    """
+    Исключаем себя, уже просмотренных/лайкнутых/скипнутых и активные мэтчи.
+    SurrealDB используем как быстрый граф, PostgreSQL — как надёжный fallback.
+    """
+    excluded_ids = {current_user.id}
+
+    try:
+        excluded_ids.update(await surreal.get_interacted_users(current_user.id))
+    except Exception as exc:
+        logger.warning(
+            "surreal_interactions_read_failed",
+            user_id=current_user.id,
+            error=str(exc),
+        )
+
+    interactions_result = await session.execute(
+        select(Interaction.to_user_id).where(Interaction.from_user_id == current_user.id)
+    )
+    excluded_ids.update(interactions_result.scalars().all())
+
+    matches_result = await session.execute(
+        select(Match).where(
+            or_(
+                Match.user1_id == current_user.id,
+                Match.user2_id == current_user.id,
+            ),
+            Match.is_active.is_(True),
+        )
+    )
+    for match in matches_result.scalars().all():
+        other_user_id = match.user2_id if match.user1_id == current_user.id else match.user1_id
+        excluded_ids.add(other_user_id)
+
+    return list(excluded_ids)
+
+
 async def _show_profile(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -794,13 +1026,7 @@ async def _show_profile(
     )
 
     # Ищем фото профиля
-    photo_result = await session.execute(
-        select(Photo).where(
-            Photo.user_id == profile_data["user_id"],
-            Photo.is_primary == True
-        )
-    )
-    primary_photo = photo_result.scalar_one_or_none()
+    primary_photo = await get_primary_photo(session, profile_data["user_id"])
 
     if primary_photo:
         loop = asyncio.get_event_loop()
@@ -886,11 +1112,14 @@ async def like_profile(
             "user1_name": other_profile.name if other_profile else "Пользователь",
         })
 
-        await callback.message.edit_text(
-            f"🎉 У вас взаимная симпатия с "
-            f"{other_profile.name if other_profile else 'пользователем'}!\n\n"
-            "Можете начать общение!",
-            reply_markup=main_menu_kb()
+        await replace_message_text(
+            callback,
+            (
+                f"🎉 У вас взаимная симпатия с "
+                f"{other_profile.name if other_profile else 'пользователем'}!\n\n"
+                f"Куда писать: {format_telegram_contact(other_user)}"
+            ),
+            main_menu_kb()
         )
     else:
         await session.commit()
@@ -979,16 +1208,22 @@ async def show_matches(callback: CallbackQuery, session: AsyncSession):
         text = "💕 Твои мэтчи:\n\n"
         for i, match in enumerate(matches, 1):
             other_user_id = match.user2_id if match.user1_id == current_user.id else match.user1_id
-            profile_result = await session.execute(
-                select(Profile).where(Profile.user_id == other_user_id)
+            match_user_result = await session.execute(
+                select(User, Profile)
+                .join(Profile, User.id == Profile.user_id)
+                .where(User.id == other_user_id)
             )
-            profile = profile_result.scalar_one_or_none()
-            if profile:
-                text += f"{i}. {profile.name or 'Без имени'}, {profile.age or '?'}\n"
+            row = match_user_result.one_or_none()
+            if row:
+                other_user, profile = row
+                text += (
+                    f"{i}. {profile.name or 'Без имени'}, {profile.age or '?'}\n"
+                    f"   Куда писать: {format_telegram_contact(other_user)}\n\n"
+                )
     else:
         text = "💔 Пока нет мэтчей.\n\nПродолжай смотреть анкеты!"
 
-    await callback.message.edit_text(text, reply_markup=back_kb())
+    await replace_message_text(callback, text, back_kb())
     await callback.answer()
 
 

@@ -12,6 +12,8 @@
         button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; }
         .ban-btn { background: #dc3545; color: white; }
         .unban-btn { background: #28a745; color: white; }
+        .avatar { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #eee; display: block; }
+        .empty-photo { width: 56px; height: 56px; border-radius: 6px; background: #eee; color: #999; display: grid; place-items: center; font-size: 12px; }
     </style>
 </head>
 <body>
@@ -21,6 +23,7 @@
             <thead>
                 <tr>
                     <th>ID</th>
+                    <th>Фото</th>
                     <th>Telegram ID</th>
                     <th>Имя</th>
                     <th>Возраст</th>
@@ -30,9 +33,16 @@
                 </tr>
             </thead>
             <tbody>
-                {% for user, profile in users %}
+                {% for user, profile, primary_photo in users %}
                 <tr class="{% if user.is_banned %}banned{% endif %}">
                     <td>{{ user.id }}</td>
+                    <td>
+                        {% if primary_photo %}
+                        <img class="avatar" src="/photos/{{ primary_photo.id }}" alt="Фото анкеты">
+                        {% else %}
+                        <div class="empty-photo">нет</div>
+                        {% endif %}
+                    </td>
                     <td>{{ user.telegram_id }}</td>
                     <td>{{ profile.name or "—" }}</td>
                     <td>{{ profile.age or "—" }}</td>
