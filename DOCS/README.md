@@ -13,17 +13,17 @@
   список мэтчей, реферальные ссылки
   
 - **Дополнительно:** Rate-limit мидлварь — защита от спама и DDoS (ограничение запросов на пользователя через Redis)
-- **Общается с:** Profile Service (REST), Matching Service (REST), RabbitMQ (кидает события), Redis (читает закэшированные анкеты + счётчики rate-limit), MinIO (забирает фото)
+- **Общается с:** внутренними модулями Profile Service и Matching Service, RabbitMQ (кидает события), Redis (читает закэшированные анкеты + счётчики rate-limit), MinIO (забирает фото)
 
 ### Profile Service
 - **Назначение:** Всё, что связано с анкетой пользователя
 - **Что делает:** Создание/редактирование/удаление анкет, валидация данных, подсчёт полноты профиля, работа с фотографиями (хранит метаданные, файлы в MinIO), реферальная система
-- **Общается с:** PostgreSQL, MinIO (S3), RabbitMQ (кидает `profile_updated`)
+- **Общается с:** PostgreSQL, MinIO (S3)
 
 ### Matching Service
 - **Назначение:** Подбор анкет, лайки, мэтчи
 - **Что делает:** Отдаёт следующую анкету (фильтрует по предпочтениям, сортирует по рейтингу, исключает уже просмотренных), обрабатывает лайки/пропуски, определяет мэтч (взаимный лайк), заранее загружает пачку из 10 анкет в Redis
-- **Общается с:** Profile Service (REST), PostgreSQL, Redis, RabbitMQ
+- **Общается с:** Profile Service как внутренним модулем, PostgreSQL, Redis, RabbitMQ
 
 ### Celery Workers (Рейтинг + Уведомления)
 - **Назначение:** Все фоновые задачи в одном месте
@@ -45,7 +45,7 @@
 | Технология | Где используется | Зачем |
 |---|---|---|
 | **Python, aiogram 3.x** | Bot Service | Асинхронная библиотека для работы с Telegram Bot API — без неё бота не сделать |
-| **Python, FastAPI** | Profile Service, Matching Service, Admin Service | REST API для общения между сервисами. Асинхронный, с автоматической валидацией через Pydantic |
+| **Python, FastAPI** | Admin Service | REST API для админ-панели. Profile Service и Matching Service сейчас реализованы как Python-модули внутри Bot Service |
 | **PostgreSQL** | Основная БД | Нужны связи между таблицами (пользователь → анкета → фото), транзакции (при создании мэтча), сложные выборки с фильтрами и сортировкой |
 | **SurrealDB** | Хранение графа взаимодействий | Interactions и matches — это по сути граф отношений между пользователями. В реляционной БД запросы типа "найди всех, кого лайкнул A, кто при этом лайкнул B" — тяжёлые JOIN'ы. В графовой/документной БД такие связи хранятся и обходятся нативно. SurrealDB совмещает документную и графовую модели, поддерживает SQL-подобный синтаксис |
 | **Redis** | Кэш анкет, rate-limit, result backend Celery | Кэш: Matching Service один раз достаёт 10 анкет и кладёт в Redis, 9 свайпов отдаются мгновенно. Rate-limit: счётчик запросов на пользователя с TTL — если превысил лимит, бот не отвечает. Без Redis пришлось бы хранить счётчики в памяти (не переживает рестарт) или в PostgreSQL (слишком медленно для каждого запроса) |
@@ -66,19 +66,18 @@
 graph TB
     TG[Telegram User] <-->|Bot API| BOT[Bot Service<br/>aiogram 3.x<br/>+ rate-limit middleware]
 
-    BOT -->|REST| PS[Profile Service<br/>FastAPI]
-    BOT -->|REST| MS[Matching Service<br/>FastAPI]
+    BOT -->|calls module| PS[Profile Service<br/>Python module]
+    BOT -->|calls module| MS[Matching Service<br/>Python module]
     BOT -->|publish events| MQ[RabbitMQ]
     BOT -->|read cached profiles<br/>+ rate-limit counters| RD[Redis]
 
     PS -->|read/write| PG[(PostgreSQL)]
     PS -->|upload/download photos| S3[MinIO S3]
-    PS -->|publish profile_updated| MQ
 
     MS -->|read/write| PG
     MS -->|read/write graph| SDB[(SurrealDB)]
     MS -->|cache profiles| RD
-    MS -->|read profiles| PS
+    MS -->|uses profile data| PG
     MS -->|publish match_created<br/>consume like, skip| MQ
 
     MQ -->|tasks + events| CW[Celery Workers<br/>Rating + Notifications]
