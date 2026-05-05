@@ -56,12 +56,28 @@ def back_kb() -> InlineKeyboardMarkup:
 def photo_management_kb(photos) -> InlineKeyboardMarkup:
     buttons = []
     for index, photo in enumerate(photos, 1):
-        label = f"🗑 Удалить фото {index}"
-        if photo.is_primary:
+        status_value = getattr(getattr(photo, "status", None), "value", getattr(photo, "status", ""))
+        status_icon = "✅" if status_value == "approved" else "⏳" if status_value == "pending" else "❌"
+        label = f"{status_icon} Удалить фото {index}"
+        if photo.is_primary and status_value == "approved":
             label += " ⭐"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"delete_photo_{photo.id}")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="edit_profile")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def matches_kb(matches) -> InlineKeyboardMarkup:
+    buttons = []
+    for index, match in enumerate(matches, 1):
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🗑 Удалить мэтч {index}",
+                callback_data=f"delete_match_{match.id}",
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 

@@ -4,11 +4,9 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select, or_, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from rabbitmq import RabbitMQClient
 from minio_client import MinioClient
-import json
 import redis.asyncio as aioredis
 from surreal import SurrealClient
 from logger import setup_logging
@@ -17,11 +15,13 @@ import time
 
 logger = setup_logging("handlers")
 
-from database import User, Profile, Preference, Match, Interaction, Rating, Referral, Gender, Photo
+from database import User, Gender
+from matching_service import MatchingService
+from profile_service import ProfileService
 from keyboards import (
     main_menu_kb, profile_menu_kb, edit_profile_kb, gender_kb,
     search_gender_kb, view_profile_kb, back_kb, search_settings_kb,
-    photo_management_kb
+    photo_management_kb, matches_kb
 )
 
 router = Router()
@@ -49,56 +49,6 @@ class PreferenceForm(StatesGroup):
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
 
-async def get_or_create_user(session: AsyncSession, telegram_id: int, username: str = None) -> User:
-    result = await session.execute(select(User).where(User.telegram_id == telegram_id))
-    user = result.scalar_one_or_none()
-
-    if not user:
-        user = User(telegram_id=telegram_id, username=username)
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
-
-        profile = Profile(user_id=user.id)
-        session.add(profile)
-
-        preference = Preference(user_id=user.id)
-        session.add(preference)
-
-        rating = Rating(user_id=user.id)
-        session.add(rating)
-
-        await session.commit()
-
-    elif user.username != username:
-        user.username = username
-        await session.commit()
-
-    return user
-
-
-def calculate_completeness(profile: Profile) -> float:
-    """
-    Считаем заполненность анкеты:
-    - 6 текстовых полей по 1 очку каждое
-    - наличие фото — ещё 1 очко
-    Итого максимум 7 очков → делим на 7
-    """
-    fields = [
-        profile.name,
-        profile.age,
-        profile.gender,
-        profile.city,
-        profile.description,
-        profile.interests,
-    ]
-    filled = sum(1 for f in fields if f)
-    # photo_count > 0 даёт +1 очко
-    if profile.photo_count and profile.photo_count > 0:
-        filled += 1
-    return filled / 7
-
-
 async def replace_message_text(callback: CallbackQuery, text: str, reply_markup=None):
     """
     Inline-кнопки могут висеть как на обычном сообщении, так и на фото с caption.
@@ -114,42 +64,6 @@ async def replace_message_text(callback: CallbackQuery, text: str, reply_markup=
             pass
         await callback.message.answer(text, reply_markup=reply_markup)
 
-
-async def get_primary_photo(session: AsyncSession, user_id: int) -> Photo | None:
-    """
-    Берём одну главную фотографию даже если из-за параллельной загрузки
-    в БД случайно оказалось несколько is_primary=True.
-    """
-    result = await session.execute(
-        select(Photo)
-        .where(Photo.user_id == user_id)
-        .order_by(Photo.is_primary.desc(), Photo.created_at.asc(), Photo.id.asc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
-
-
-async def get_user_photos(session: AsyncSession, user_id: int) -> list[Photo]:
-    result = await session.execute(
-        select(Photo)
-        .where(Photo.user_id == user_id)
-        .order_by(Photo.is_primary.desc(), Photo.created_at.asc(), Photo.id.asc())
-    )
-    return list(result.scalars().all())
-
-
-async def update_profile_photo_stats(session: AsyncSession, user_id: int):
-    photos = await get_user_photos(session, user_id)
-    profile_result = await session.execute(
-        select(Profile).where(Profile.user_id == user_id)
-    )
-    profile = profile_result.scalar_one_or_none()
-    if profile:
-        profile.photo_count = len(photos)
-        profile.completeness = calculate_completeness(profile)
-    return photos
-
-
 def format_telegram_contact(user: User | None) -> str:
     if user and user.username:
         return f"@{user.username}"
@@ -162,8 +76,10 @@ def format_telegram_contact(user: User | None) -> str:
 async def cmd_start(message: Message, session: AsyncSession):
     REQUESTS_TOTAL.labels(handler="start").inc()
 
-    user = await get_or_create_user(
-        session, message.from_user.id, message.from_user.username
+    profile_service = ProfileService(session)
+    user = await profile_service.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
     )
 
     # Проверяем бан
@@ -175,7 +91,7 @@ async def cmd_start(message: Message, session: AsyncSession):
 
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("ref_"):
-        await process_referral(session, user, args[1])
+        await profile_service.process_referral(user, args[1])
 
     await message.answer(
         f"👋 Привет! Добро пожаловать в Dating Bot!\n\n"
@@ -184,42 +100,6 @@ async def cmd_start(message: Message, session: AsyncSession):
         reply_markup=main_menu_kb()
     )
     
-
-async def process_referral(session: AsyncSession, new_user: User, ref_code: str):
-    """
-    ref_code выглядит как "ref_5497326447"
-    Извлекаем telegram_id реферера, находим его в БД,
-    записываем связь в таблицу referrals
-    """
-    try:
-        referrer_telegram_id = int(ref_code.replace("ref_", ""))
-    except ValueError:
-        return
-
-    # Не записываем если человек сам себя пригласил
-    if referrer_telegram_id == new_user.telegram_id:
-        return
-
-    # Находим реферера
-    result = await session.execute(
-        select(User).where(User.telegram_id == referrer_telegram_id)
-    )
-    referrer = result.scalar_one_or_none()
-    if not referrer:
-        return
-
-    # Проверяем что этот пользователь ещё не был приглашён кем-то
-    # (referred_id уникален в таблице)
-    existing = await session.execute(
-        select(Referral).where(Referral.referred_id == new_user.id)
-    )
-    if existing.scalar_one_or_none():
-        return
-
-    referral = Referral(referrer_id=referrer.id, referred_id=new_user.id)
-    session.add(referral)
-    await session.commit()
-
 
 # ─── Главное меню ─────────────────────────────────────────────────────────────
 
@@ -237,10 +117,8 @@ async def show_main_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data == "my_profile")
 async def show_profile(callback: CallbackQuery, session: AsyncSession, minio: MinioClient):
-    result = await session.execute(
-        select(Profile).join(User).where(User.telegram_id == callback.from_user.id)
-    )
-    profile = result.scalar_one_or_none()
+    profile_service = ProfileService(session)
+    profile = await profile_service.get_profile_by_telegram_id(callback.from_user.id)
 
     if profile:
         gender_text = "Мужской" if profile.gender == Gender.MALE else "Женский" if profile.gender == Gender.FEMALE else "Не указан"
@@ -258,7 +136,7 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession, minio: Mi
         text = "Анкета не найдена. Начни с /start"
 
     if profile:
-        primary_photo = await get_primary_photo(session, profile.user_id)
+        primary_photo = await profile_service.get_primary_photo(profile.user_id)
 
         if primary_photo:
             loop = asyncio.get_event_loop()
@@ -304,14 +182,11 @@ async def edit_name(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ProfileForm.name)
 async def process_name(message: Message, state: FSMContext, session: AsyncSession):
-    result = await session.execute(
-        select(Profile).join(User).where(User.telegram_id == message.from_user.id)
+    await ProfileService(session).update_profile_field(
+        message.from_user.id,
+        "name",
+        message.text,
     )
-    profile = result.scalar_one_or_none()
-    if profile:
-        profile.name = message.text
-        profile.completeness = calculate_completeness(profile)
-        await session.commit()
     await state.clear()
     await message.answer("✅ Имя сохранено!", reply_markup=main_menu_kb())
 
@@ -328,14 +203,11 @@ async def process_age(message: Message, state: FSMContext, session: AsyncSession
     try:
         age = int(message.text)
         if 18 <= age <= 100:
-            result = await session.execute(
-                select(Profile).join(User).where(User.telegram_id == message.from_user.id)
+            await ProfileService(session).update_profile_field(
+                message.from_user.id,
+                "age",
+                age,
             )
-            profile = result.scalar_one_or_none()
-            if profile:
-                profile.age = age
-                profile.completeness = calculate_completeness(profile)
-                await session.commit()
             await state.clear()
             await message.answer("✅ Возраст сохранён!", reply_markup=main_menu_kb())
         else:
@@ -353,14 +225,11 @@ async def edit_gender(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("set_gender_"))
 async def process_gender(callback: CallbackQuery, session: AsyncSession):
     gender = Gender.MALE if callback.data == "set_gender_male" else Gender.FEMALE
-    result = await session.execute(
-        select(Profile).join(User).where(User.telegram_id == callback.from_user.id)
+    await ProfileService(session).update_profile_field(
+        callback.from_user.id,
+        "gender",
+        gender,
     )
-    profile = result.scalar_one_or_none()
-    if profile:
-        profile.gender = gender
-        profile.completeness = calculate_completeness(profile)
-        await session.commit()
     await callback.message.edit_text("✅ Пол сохранён!", reply_markup=main_menu_kb())
     await callback.answer()
 
@@ -374,14 +243,11 @@ async def edit_city(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ProfileForm.city)
 async def process_city(message: Message, state: FSMContext, session: AsyncSession):
-    result = await session.execute(
-        select(Profile).join(User).where(User.telegram_id == message.from_user.id)
+    await ProfileService(session).update_profile_field(
+        message.from_user.id,
+        "city",
+        message.text,
     )
-    profile = result.scalar_one_or_none()
-    if profile:
-        profile.city = message.text
-        profile.completeness = calculate_completeness(profile)
-        await session.commit()
     await state.clear()
     await message.answer("✅ Город сохранён!", reply_markup=main_menu_kb())
 
@@ -395,14 +261,11 @@ async def edit_description(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ProfileForm.description)
 async def process_description(message: Message, state: FSMContext, session: AsyncSession):
-    result = await session.execute(
-        select(Profile).join(User).where(User.telegram_id == message.from_user.id)
+    await ProfileService(session).update_profile_field(
+        message.from_user.id,
+        "description",
+        message.text,
     )
-    profile = result.scalar_one_or_none()
-    if profile:
-        profile.description = message.text
-        profile.completeness = calculate_completeness(profile)
-        await session.commit()
     await state.clear()
     await message.answer("✅ Описание сохранено!", reply_markup=main_menu_kb())
 
@@ -416,14 +279,11 @@ async def edit_interests(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ProfileForm.interests)
 async def process_interests(message: Message, state: FSMContext, session: AsyncSession):
-    result = await session.execute(
-        select(Profile).join(User).where(User.telegram_id == message.from_user.id)
+    await ProfileService(session).update_profile_field(
+        message.from_user.id,
+        "interests",
+        message.text,
     )
-    profile = result.scalar_one_or_none()
-    if profile:
-        profile.interests = message.text
-        profile.completeness = calculate_completeness(profile)
-        await session.commit()
     await state.clear()
     await message.answer("✅ Интересы сохранены!", reply_markup=main_menu_kb())
 
@@ -434,18 +294,18 @@ async def process_interests(message: Message, state: FSMContext, session: AsyncS
 async def edit_photo(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     await state.set_state(ProfileForm.photo)
 
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
-    photos = await get_user_photos(session, current_user.id) if current_user else []
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
+    photos = await profile_service.get_user_photos(current_user.id) if current_user else []
+    approved_count, pending_count = profile_service.get_photo_counts(photos)
 
     await replace_message_text(
         callback,
         "📷 Фото профиля\n\n"
-        f"Загружено: {len(photos)}/5\n\n"
+        f"Одобрено: {approved_count}/5\n"
+        f"На проверке: {pending_count}\n\n"
         "Можно отправить одно фото или альбом из нескольких фото. "
-        "Первое загруженное фото будет главным.",
+        "Новые фото не показываются в профиле, пока админ их не одобрит.",
         photo_management_kb(photos)
     )
     await callback.answer()
@@ -459,34 +319,26 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
     message.photo — это список объектов PhotoSize в разных разрешениях
     [-1] — берём последний элемент = самое большое разрешение
     """
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == message.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(message.from_user.id)
 
     if not current_user:
         await message.answer("Сначала зарегистрируйся с /start")
         await state.clear()
         return
 
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": current_user.id},
+    existing_photos = await profile_service.get_user_photos(current_user.id)
+    active_photos_count = sum(
+        1
+        for photo in existing_photos
+        if getattr(photo.status, "value", photo.status) != "rejected"
     )
 
-    # Проверяем сколько фото уже загружено
-    photos_result = await session.execute(
-        select(Photo).where(Photo.user_id == current_user.id)
-    )
-    existing_photos = photos_result.scalars().all()
-
-    if len(existing_photos) >= 5:
-        photos = await get_user_photos(session, current_user.id)
+    if active_photos_count >= profile_service.MAX_ACTIVE_PHOTOS:
         await message.answer(
             "❌ Максимум 5 фото. Удали старое чтобы добавить новое.",
-            reply_markup=photo_management_kb(photos)
+            reply_markup=photo_management_kb(existing_photos)
         )
-        await session.rollback()
         return
 
     # Скачиваем фото из Telegram
@@ -508,33 +360,22 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
         current_user.telegram_id
     )
 
-    # Первое фото — главное.
-    is_primary = not any(photo.is_primary for photo in existing_photos)
-
-    if is_primary:
-        await session.execute(
-            update(Photo)
-            .where(Photo.user_id == current_user.id)
-            .values(is_primary=False)
+    added, photos = await profile_service.add_pending_photo(current_user.id, s3_key)
+    if not added:
+        await message.answer(
+            "❌ Максимум 5 фото. Удали старое чтобы добавить новое.",
+            reply_markup=photo_management_kb(photos),
         )
+        return
 
-    # Сохраняем метаданные в PostgreSQL
-    # Сам файл в MinIO, в БД только путь к нему
-    photo_record = Photo(
-        user_id=current_user.id,
-        s3_key=s3_key,
-        is_primary=is_primary
-    )
-    session.add(photo_record)
-    await session.flush()
-
-    photos = await update_profile_photo_stats(session, current_user.id)
-    await session.commit()
+    photos = await profile_service.get_user_photos(current_user.id)
+    approved_count, pending_count = profile_service.get_photo_counts(photos)
 
     await message.answer(
-        f"✅ Фото загружено! {'(главное фото профиля)' if is_primary else ''}\n"
-        f"Всего фото: {len(photos)}/5\n\n"
-        "Можно отправить ещё фото или удалить лишние ниже.",
+        "⏳ Фото загружено и отправлено на проверку.\n"
+        f"Одобрено: {approved_count}/5\n"
+        f"На проверке: {pending_count}\n\n"
+        "Пока фото не одобрят, оно не появится в профиле.",
         reply_markup=photo_management_kb(photos)
     )
 
@@ -554,29 +395,14 @@ async def delete_photo(
         await callback.answer("Некорректное фото", show_alert=True)
         return
 
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
     if not current_user:
         await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
         return
 
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": current_user.id},
-    )
-
-    photo_result = await session.execute(
-        select(Photo).where(
-            Photo.id == photo_id,
-            Photo.user_id == current_user.id,
-        )
-    )
-    photo = photo_result.scalar_one_or_none()
-    if not photo:
-        photos = await get_user_photos(session, current_user.id)
-        await session.rollback()
+    deleted, s3_key, photos = await profile_service.delete_photo(current_user.id, photo_id)
+    if not deleted:
         await replace_message_text(
             callback,
             f"📷 Фото профиля\n\nЗагружено: {len(photos)}/5",
@@ -585,35 +411,19 @@ async def delete_photo(
         await callback.answer("Фото уже удалено")
         return
 
-    was_primary = bool(photo.is_primary)
-    s3_key = photo.s3_key
-
-    await session.delete(photo)
-    await session.flush()
-
-    remaining_photos = await get_user_photos(session, current_user.id)
-    if remaining_photos and (was_primary or not any(p.is_primary for p in remaining_photos)):
-        await session.execute(
-            update(Photo)
-            .where(Photo.user_id == current_user.id)
-            .values(is_primary=False)
-        )
-        remaining_photos[0].is_primary = True
-        await session.flush()
-
-    photos = await update_profile_photo_stats(session, current_user.id)
-    await session.commit()
-
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, minio.delete_photo, s3_key)
     except Exception as exc:
         logger.warning("minio_photo_delete_failed", photo_id=photo_id, error=str(exc))
 
+    approved_count, pending_count = profile_service.get_photo_counts(photos)
+
     await replace_message_text(
         callback,
         "🗑 Фото удалено.\n\n"
-        f"Загружено: {len(photos)}/5\n\n"
+        f"Одобрено: {approved_count}/5\n"
+        f"На проверке: {pending_count}\n\n"
         "Можно отправить ещё фото или удалить лишние ниже.",
         photo_management_kb(photos)
     )
@@ -631,10 +441,9 @@ async def process_photo_wrong(message: Message):
 
 @router.callback_query(F.data == "search_settings")
 async def search_settings(callback: CallbackQuery, session: AsyncSession):
-    result = await session.execute(
-        select(Preference).join(User).where(User.telegram_id == callback.from_user.id)
+    pref = await ProfileService(session).get_preference_by_telegram_id(
+        callback.from_user.id
     )
-    pref = result.scalar_one_or_none()
 
     if pref:
         gender_text = (
@@ -681,13 +490,11 @@ async def process_search_gender(callback: CallbackQuery, session: AsyncSession):
     }
     preferred_gender = gender_map.get(callback.data)
 
-    result = await session.execute(
-        select(Preference).join(User).where(User.telegram_id == callback.from_user.id)
+    await ProfileService(session).update_preference_field(
+        callback.from_user.id,
+        "preferred_gender",
+        preferred_gender,
     )
-    pref = result.scalar_one_or_none()
-    if pref:
-        pref.preferred_gender = preferred_gender
-        await session.commit()
 
     await callback.message.edit_text("✅ Сохранено!", reply_markup=search_settings_kb())
     await callback.answer()
@@ -708,13 +515,11 @@ async def process_min_age(message: Message, state: FSMContext, session: AsyncSes
     try:
         age = int(message.text)
         if 18 <= age <= 99:
-            result = await session.execute(
-                select(Preference).join(User).where(User.telegram_id == message.from_user.id)
+            await ProfileService(session).update_preference_field(
+                message.from_user.id,
+                "min_age",
+                age,
             )
-            pref = result.scalar_one_or_none()
-            if pref:
-                pref.min_age = age
-                await session.commit()
             await state.clear()
             await message.answer("✅ Минимальный возраст сохранён!", reply_markup=main_menu_kb())
         else:
@@ -738,13 +543,11 @@ async def process_max_age(message: Message, state: FSMContext, session: AsyncSes
     try:
         age = int(message.text)
         if 19 <= age <= 100:
-            result = await session.execute(
-                select(Preference).join(User).where(User.telegram_id == message.from_user.id)
+            await ProfileService(session).update_preference_field(
+                message.from_user.id,
+                "max_age",
+                age,
             )
-            pref = result.scalar_one_or_none()
-            if pref:
-                pref.max_age = age
-                await session.commit()
             await state.clear()
             await message.answer("✅ Максимальный возраст сохранён!", reply_markup=main_menu_kb())
         else:
@@ -765,14 +568,12 @@ async def edit_search_city(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PreferenceForm.city)
 async def process_search_city(message: Message, state: FSMContext, session: AsyncSession):
-    result = await session.execute(
-        select(Preference).join(User).where(User.telegram_id == message.from_user.id)
+    preferred_city = None if message.text.lower() == "любой" else message.text
+    await ProfileService(session).update_preference_field(
+        message.from_user.id,
+        "preferred_city",
+        preferred_city,
     )
-    pref = result.scalar_one_or_none()
-    if pref:
-        # если написал "любой" — убираем фильтр по городу
-        pref.preferred_city = None if message.text.lower() == "любой" else message.text
-        await session.commit()
     await state.clear()
     await message.answer("✅ Город поиска сохранён!", reply_markup=main_menu_kb())
 
@@ -785,16 +586,13 @@ async def show_referral(callback: CallbackQuery, session: AsyncSession):
     Генерируем ссылку вида: t.me/{bot_username}?start=ref_{telegram_id}
     Telegram сам передаст payload в /start команду
     """
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
+    if not current_user:
+        await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
+        return
 
-    # Считаем сколько людей уже пришло по нашей ссылке
-    referrals_result = await session.execute(
-        select(Referral).where(Referral.referrer_id == current_user.id)
-    )
-    referrals_count = len(referrals_result.scalars().all())
+    referrals_count = await profile_service.count_referrals(current_user.id)
 
     # Получаем username бота
     bot: Bot = callback.bot
@@ -828,38 +626,20 @@ async def view_profiles(
     start_time = time.time()
     REQUESTS_TOTAL.labels(handler="view_profiles").inc()
     
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
+    profile_service = ProfileService(session)
+    matching_service = MatchingService(session, redis, surreal)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
 
     if not current_user:
         await callback.message.edit_text("Сначала зарегистрируйся с /start")
         await callback.answer()
         return
 
-    cache_key = f"profiles_cache:{current_user.id}"
-    cached = await redis.rpop(cache_key)
-
-    if cached:
-        profile_data = json.loads(cached)
-        excluded_ids = await get_excluded_profile_ids(session, current_user, surreal)
-        if profile_data["user_id"] in excluded_ids:
-            CACHE_MISSES.inc()
-            logger.info("cache_stale", user_id=current_user.id)
-            await redis.delete(cache_key)
-            profile_data = await _fetch_profiles_from_db(
-                session, current_user, redis, cache_key, surreal
-            )
-        else:
-            CACHE_HITS.inc()  # метрика
-            logger.info("cache_hit", user_id=current_user.id)
+    profile_data = await matching_service.get_next_profile(current_user)
+    if matching_service.last_cache_status == "hit":
+        CACHE_HITS.inc()
     else:
-        CACHE_MISSES.inc()  # метрика
-        logger.info("cache_miss", user_id=current_user.id)
-        profile_data = await _fetch_profiles_from_db(
-            session, current_user, redis, cache_key, surreal
-        )
+        CACHE_MISSES.inc()
 
     if not profile_data:
         await replace_message_text(
@@ -870,19 +650,7 @@ async def view_profiles(
         await callback.answer()
         return
 
-    view_interaction = Interaction(
-        from_user_id=current_user.id,
-        to_user_id=profile_data["user_id"],
-        action="view"
-    )
-    session.add(view_interaction)
-    await session.commit()
-
-    await surreal.add_interaction(
-        from_user_id=current_user.id,
-        to_user_id=profile_data["user_id"],
-        action="viewed"
-    )
+    await matching_service.record_view(current_user.id, profile_data["user_id"])
 
     await state.update_data(viewing_user_id=profile_data["user_id"])
     await _show_profile(callback, session, minio, profile_data)
@@ -892,112 +660,6 @@ async def view_profiles(
     duration = time.time() - start_time
     REQUEST_DURATION.labels(handler="view_profiles").observe(duration)
     logger.info("request_completed", handler="view_profiles", duration=duration)
-
-
-async def _fetch_profiles_from_db(
-    session: AsyncSession,
-    current_user: User,
-    redis: aioredis.Redis,
-    cache_key: str,
-    surreal: SurrealClient,
-) -> dict | None:
-    pref_result = await session.execute(
-        select(Preference).where(Preference.user_id == current_user.id)
-    )
-    pref = pref_result.scalar_one_or_none()
-
-    excluded_ids = await get_excluded_profile_ids(session, current_user, surreal)
-
-    query = (
-        select(Profile)
-        .join(User)
-        .join(Rating, User.id == Rating.user_id)
-        .where(
-            Profile.user_id.not_in(excluded_ids),
-            Profile.completeness > 0.3,
-        )
-    )
-
-    if pref:
-        if pref.preferred_gender:
-            query = query.where(Profile.gender == pref.preferred_gender)
-        if pref.min_age:
-            query = query.where(Profile.age >= pref.min_age)
-        if pref.max_age:
-            query = query.where(Profile.age <= pref.max_age)
-        if pref.preferred_city:
-            query = query.where(Profile.city == pref.preferred_city)
-
-    query = query.order_by(Rating.combined_score.desc()).limit(10)
-    result = await session.execute(query)
-    profiles = result.scalars().all()
-
-    if not profiles:
-        return None
-
-    def profile_to_dict(p: Profile) -> dict:
-        return {
-            "user_id": p.user_id,
-            "name": p.name,
-            "age": p.age,
-            "gender": p.gender.value if p.gender else None,
-            "city": p.city,
-            "description": p.description,
-            "interests": p.interests,
-        }
-
-    all_dicts = [profile_to_dict(p) for p in profiles]
-
-    if len(all_dicts) > 1:
-        rest = all_dicts[1:]
-        pipe = redis.pipeline()
-        for profile_dict in rest:
-            pipe.lpush(cache_key, json.dumps(profile_dict))
-        pipe.expire(cache_key, 3600)
-        await pipe.execute()
-
-    return all_dicts[0]
-
-
-async def get_excluded_profile_ids(
-    session: AsyncSession,
-    current_user: User,
-    surreal: SurrealClient,
-) -> list[int]:
-    """
-    Исключаем себя, уже просмотренных/лайкнутых/скипнутых и активные мэтчи.
-    SurrealDB используем как быстрый граф, PostgreSQL — как надёжный fallback.
-    """
-    excluded_ids = {current_user.id}
-
-    try:
-        excluded_ids.update(await surreal.get_interacted_users(current_user.id))
-    except Exception as exc:
-        logger.warning(
-            "surreal_interactions_read_failed",
-            user_id=current_user.id,
-            error=str(exc),
-        )
-
-    interactions_result = await session.execute(
-        select(Interaction.to_user_id).where(Interaction.from_user_id == current_user.id)
-    )
-    excluded_ids.update(interactions_result.scalars().all())
-
-    matches_result = await session.execute(
-        select(Match).where(
-            or_(
-                Match.user1_id == current_user.id,
-                Match.user2_id == current_user.id,
-            ),
-            Match.is_active.is_(True),
-        )
-    )
-    for match in matches_result.scalars().all():
-        other_user_id = match.user2_id if match.user1_id == current_user.id else match.user1_id
-        excluded_ids.add(other_user_id)
-
-    return list(excluded_ids)
 
 
 async def _show_profile(
@@ -1026,7 +688,9 @@ async def _show_profile(
     )
 
     # Ищем фото профиля
-    primary_photo = await get_primary_photo(session, profile_data["user_id"])
+    primary_photo = await ProfileService(session).get_primary_photo(
+        profile_data["user_id"]
+    )
 
     if primary_photo:
         loop = asyncio.get_event_loop()
@@ -1066,51 +730,28 @@ async def like_profile(
         await callback.answer("Ошибка: анкета не найдена")
         return
 
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
+    profile_service = ProfileService(session)
+    matching_service = MatchingService(session, redis, surreal)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
+    if not current_user:
+        await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
+        return
 
-    # PostgreSQL
-    like_interaction = Interaction(
-        from_user_id=current_user.id,
-        to_user_id=viewing_user_id,
-        action="like"
-    )
-    session.add(like_interaction)
+    result = await matching_service.like_profile(current_user, viewing_user_id)
 
-    # SurrealDB граф
-    await surreal.add_interaction(
-        from_user_id=current_user.id,
-        to_user_id=viewing_user_id,
-        action="liked"
-    )
+    if result["is_mutual"]:
+        other_profile = await profile_service.get_profile_by_user_id(viewing_user_id)
+        other_user = await profile_service.get_user_by_id(viewing_user_id)
+        if not other_user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
 
-    # Проверка взаимного лайка — сначала через SurrealDB (быстрее)
-    is_mutual = await surreal.check_mutual_like(current_user.id, viewing_user_id)
-
-    if is_mutual:
-        user1_id = min(current_user.id, viewing_user_id)
-        user2_id = max(current_user.id, viewing_user_id)
-        match = Match(user1_id=user1_id, user2_id=user2_id)
-        session.add(match)
-        await session.commit()
-
-        other_result = await session.execute(
-            select(Profile).where(Profile.user_id == viewing_user_id)
-        )
-        other_profile = other_result.scalar_one_or_none()
-
-        other_user_result = await session.execute(
-            select(User).where(User.id == viewing_user_id)
-        )
-        other_user = other_user_result.scalar_one_or_none()
-
-        await rabbitmq.publish("match", {
-            "user1_telegram_id": current_user.telegram_id,
-            "user2_telegram_id": other_user.telegram_id,
-            "user1_name": other_profile.name if other_profile else "Пользователь",
-        })
+        if result["is_new_match"]:
+            await rabbitmq.publish("match", {
+                "user1_telegram_id": current_user.telegram_id,
+                "user2_telegram_id": other_user.telegram_id,
+                "user1_name": other_profile.name if other_profile else "Пользователь",
+            })
 
         await replace_message_text(
             callback,
@@ -1122,7 +763,6 @@ async def like_profile(
             main_menu_kb()
         )
     else:
-        await session.commit()
         await rabbitmq.publish("like", {
             "from_user_id": current_user.id,
             "to_user_id": viewing_user_id,
@@ -1149,25 +789,16 @@ async def skip_profile(
         await callback.answer("Ошибка: анкета не найдена")
         return
 
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
+    current_user = await ProfileService(session).get_user_by_telegram_id(
+        callback.from_user.id
     )
-    current_user = user_result.scalar_one_or_none()
+    if not current_user:
+        await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
+        return
 
-    # PostgreSQL
-    skip_interaction = Interaction(
-        from_user_id=current_user.id,
-        to_user_id=viewing_user_id,
-        action="skip"
-    )
-    session.add(skip_interaction)
-    await session.commit()
-
-    # SurrealDB граф
-    await surreal.add_interaction(
-        from_user_id=current_user.id,
-        to_user_id=viewing_user_id,
-        action="skipped"
+    await MatchingService(session, redis, surreal).skip_profile(
+        current_user,
+        viewing_user_id,
     )
 
     await rabbitmq.publish("skip", {
@@ -1182,40 +813,23 @@ async def skip_profile(
 # ─── Матчи ────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "my_matches")
-async def show_matches(callback: CallbackQuery, session: AsyncSession):
-    user_result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    current_user = user_result.scalar_one_or_none()
+async def show_matches(callback: CallbackQuery, session: AsyncSession, answer_callback: bool = True):
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
 
     if not current_user:
         await callback.answer("Ошибка")
         return
 
-    matches_result = await session.execute(
-        select(Match).where(
-            or_(
-                Match.user1_id == current_user.id,
-                Match.user2_id == current_user.id
-            ),
-            Match.is_active.is_(True)
-        )
-    )
-    
-    matches = matches_result.scalars().all()
+    matches = await MatchingService(session, None, None).get_active_matches(current_user.id)
 
     if matches:
         text = "💕 Твои мэтчи:\n\n"
         for i, match in enumerate(matches, 1):
             other_user_id = match.user2_id if match.user1_id == current_user.id else match.user1_id
-            match_user_result = await session.execute(
-                select(User, Profile)
-                .join(Profile, User.id == Profile.user_id)
-                .where(User.id == other_user_id)
-            )
-            row = match_user_result.one_or_none()
-            if row:
-                other_user, profile = row
+            other_user = await profile_service.get_user_by_id(other_user_id)
+            profile = await profile_service.get_profile_by_user_id(other_user_id)
+            if other_user and profile:
                 text += (
                     f"{i}. {profile.name or 'Без имени'}, {profile.age or '?'}\n"
                     f"   Куда писать: {format_telegram_contact(other_user)}\n\n"
@@ -1223,8 +837,39 @@ async def show_matches(callback: CallbackQuery, session: AsyncSession):
     else:
         text = "💔 Пока нет мэтчей.\n\nПродолжай смотреть анкеты!"
 
-    await replace_message_text(callback, text, back_kb())
-    await callback.answer()
+    await replace_message_text(callback, text, matches_kb(matches) if matches else back_kb())
+    if answer_callback:
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delete_match_"))
+async def delete_match(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    redis: aioredis.Redis,
+    surreal: SurrealClient,
+):
+    try:
+        match_id = int(callback.data.replace("delete_match_", ""))
+    except ValueError:
+        await callback.answer("Некорректный мэтч", show_alert=True)
+        return
+
+    current_user = await ProfileService(session).get_user_by_telegram_id(
+        callback.from_user.id
+    )
+    if not current_user:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    matching_service = MatchingService(session, redis, surreal)
+    deleted, _ = await matching_service.delete_match(current_user.id, match_id)
+    if not deleted:
+        await show_matches(callback, session, answer_callback=False)
+        await callback.answer("Мэтч уже удалён")
+        return
+    await show_matches(callback, session, answer_callback=False)
+    await callback.answer("Мэтч удалён")
 
 
 # ─── Назад ────────────────────────────────────────────────────────────────────

@@ -17,3 +17,11 @@ prometheus_data/
 # IDE
 .vscode/
 .idea/
+
+# chortovi zadaniya
+task4/
+task3/
+task2/
+task1/
+
+.codex

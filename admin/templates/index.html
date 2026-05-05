@@ -21,6 +21,7 @@
             <nav>
                 <a href="/">Статистика</a>
                 <a href="/users">Пользователи</a>
+                <a href="/moderation/photos">Модерация фото</a>
                 <a href="/stats">Подробная статистика</a>
             </nav>
         </div>
@@ -41,6 +42,10 @@
             <div class="stat-card">
                 <h2>{{ likes_today }}</h2>
                 <p>Лайков сегодня</p>
+            </div>
+            <div class="stat-card">
+                <h2>{{ pending_photos }}</h2>
+                <p>Фото на проверке</p>
             </div>
         </div>
     </div>

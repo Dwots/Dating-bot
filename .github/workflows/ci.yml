@@ -23,15 +23,28 @@ jobs:
       
       - name: Lint with ruff
         run: |
-          ruff check bot/ workers/ --ignore E501,F401
+          ruff check bot/ workers/ admin/ benchmark/ --ignore E501,F401
+
+      - name: Compile Python files
+        run: |
+          python -m compileall bot workers admin benchmark
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
+      - name: Validate docker compose
+        run: docker compose config
       
       - name: Build bot image
         run: docker build ./bot
       
       - name: Build workers image
         run: docker build ./workers
+
+      - name: Build admin image
+        run: docker build -f admin/Dockerfile .
+
+      - name: Build benchmark image
+        run: docker build ./benchmark

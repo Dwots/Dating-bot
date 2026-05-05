@@ -115,3 +115,19 @@ class SurrealClient:
 
         # Если есть хотя бы одна запись — взаимный лайк
         return result and len(result) > 0 and "result" in result[0] and len(result[0]["result"]) > 0
+
+    async def delete_interactions_between(self, user1_id: int, user2_id: int):
+        """
+        Удаляем графовые связи между двумя пользователями в обе стороны.
+        Это нужно при удалении мэтча, чтобы пара могла встретиться заново.
+        """
+        query = f"""
+        DELETE liked WHERE (out = user:{user1_id} AND in = user:{user2_id})
+            OR (out = user:{user2_id} AND in = user:{user1_id});
+        DELETE skipped WHERE (out = user:{user1_id} AND in = user:{user2_id})
+            OR (out = user:{user2_id} AND in = user:{user1_id});
+        DELETE viewed WHERE (out = user:{user1_id} AND in = user:{user2_id})
+            OR (out = user:{user2_id} AND in = user:{user1_id});
+        """
+        await self.db.query(query)
+        logger.debug(f"Graph edges deleted between {user1_id} and {user2_id}")

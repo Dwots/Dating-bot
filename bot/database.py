@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Float, DateTime, Text, Enum as SQLEnum, ForeignKey
+from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Float, DateTime, Text, Enum as SQLEnum, ForeignKey, text
 from sqlalchemy.sql import func
 import enum
 
@@ -99,6 +99,25 @@ class Database:
     async def create_tables(self):
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(text("""
+                ALTER TABLE photos
+                ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+            """))
+            await conn.execute(text("""
+                UPDATE photos
+                SET status = 'APPROVED'
+                WHERE status IS NULL OR status = 'approved'
+            """))
+            await conn.execute(text("""
+                UPDATE photos
+                SET status = 'REJECTED'
+                WHERE status = 'rejected'
+            """))
+            await conn.execute(text("""
+                UPDATE photos
+                SET status = 'PENDING'
+                WHERE status = 'pending'
+            """))
 
     async def get_session(self) -> AsyncSession:
         async with self.session_factory() as session:
@@ -123,5 +142,6 @@ class Photo(Base):
     # s3_key — путь к файлу в MinIO, например "photos/123456/abc.jpg"
     # по нему мы потом достаём файл обратно
     s3_key = Column(String(500), nullable=False)
+    status = Column(SQLEnum(ModerationStatus), default=ModerationStatus.PENDING, nullable=False)
     is_primary = Column(Boolean, default=False)  # главное фото профиля
     created_at = Column(DateTime(timezone=True), server_default=func.now())

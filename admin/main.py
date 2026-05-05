@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # Импортируем модели из bot (Docker volume или копируем)
 import sys
 sys.path.append("/bot")
-from database import User, Profile, Match, Interaction, Rating, Photo
+from database import User, Profile, Match, Interaction, Rating, Photo, ModerationStatus
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -65,6 +65,9 @@ async def index(request: Request):
         Interaction.action == "like",
         Interaction.created_at > datetime.utcnow() - timedelta(days=1)
     ).scalar()
+    pending_photos = db.query(func.count(Photo.id)).filter(
+        Photo.status == ModerationStatus.PENDING
+    ).scalar()
     
     db.close()
     
@@ -74,6 +77,7 @@ async def index(request: Request):
         "total_matches": total_matches,
         "active_users": active_users,
         "likes_today": likes_today,
+        "pending_photos": pending_photos,
     })
 
 
@@ -87,6 +91,7 @@ async def users_list(request: Request):
     for user, profile in rows:
         primary_photo = db.query(Photo).filter(
             Photo.user_id == user.id,
+            Photo.status == ModerationStatus.APPROVED,
         ).order_by(
             Photo.is_primary.desc(),
             Photo.created_at.asc(),
@@ -116,6 +121,103 @@ async def photo_preview(photo_id: int):
     content = response["Body"].read()
     content_type = response.get("ContentType") or "image/jpeg"
     return StreamingResponse(io.BytesIO(content), media_type=content_type)
+
+
+@app.get("/moderation/photos")
+async def moderation_photos(request: Request):
+    db = get_db()
+    rows = db.query(Photo, User, Profile).join(
+        User, User.id == Photo.user_id
+    ).join(
+        Profile, Profile.user_id == User.id
+    ).filter(
+        Photo.status == ModerationStatus.PENDING
+    ).order_by(Photo.created_at.asc()).all()
+    db.close()
+
+    return templates.TemplateResponse("moderation_photos.html", {
+        "request": request,
+        "photos": rows,
+    })
+
+
+@app.post("/moderation/photos/{photo_id}/approve")
+async def approve_photo(photo_id: int):
+    db = get_db()
+    photo = db.query(Photo).filter(Photo.id == photo_id).first()
+    if photo:
+        approved_exists = db.query(Photo.id).filter(
+            Photo.user_id == photo.user_id,
+            Photo.status == ModerationStatus.APPROVED,
+            Photo.is_primary.is_(True),
+        ).first()
+        if not approved_exists:
+            db.query(Photo).filter(Photo.user_id == photo.user_id).update({"is_primary": False})
+            photo.is_primary = True
+        photo.status = ModerationStatus.APPROVED
+
+        approved_count = db.query(func.count(Photo.id)).filter(
+            Photo.user_id == photo.user_id,
+            Photo.status == ModerationStatus.APPROVED,
+        ).scalar()
+
+        profile = db.query(Profile).filter(Profile.user_id == photo.user_id).first()
+        if profile:
+            profile.photo_count = approved_count
+            filled_fields = [
+                profile.name,
+                profile.age,
+                profile.gender,
+                profile.city,
+                profile.description,
+                profile.interests,
+            ]
+            profile.completeness = (sum(1 for value in filled_fields if value) + 1) / 7
+        db.commit()
+    db.close()
+    return RedirectResponse(url="/moderation/photos", status_code=303)
+
+
+@app.post("/moderation/photos/{photo_id}/reject")
+async def reject_photo(photo_id: int):
+    db = get_db()
+    photo = db.query(Photo).filter(Photo.id == photo_id).first()
+    if photo:
+        photo.status = ModerationStatus.REJECTED
+        photo.is_primary = False
+
+        approved_count = db.query(func.count(Photo.id)).filter(
+            Photo.user_id == photo.user_id,
+            Photo.status == ModerationStatus.APPROVED,
+        ).scalar()
+        approved_primary = db.query(Photo).filter(
+            Photo.user_id == photo.user_id,
+            Photo.status == ModerationStatus.APPROVED,
+            Photo.is_primary.is_(True),
+        ).first()
+        if approved_count and not approved_primary:
+            fallback_photo = db.query(Photo).filter(
+                Photo.user_id == photo.user_id,
+                Photo.status == ModerationStatus.APPROVED,
+            ).order_by(Photo.created_at.asc(), Photo.id.asc()).first()
+            if fallback_photo:
+                fallback_photo.is_primary = True
+
+        profile = db.query(Profile).filter(Profile.user_id == photo.user_id).first()
+        if profile:
+            profile.photo_count = approved_count
+            filled_fields = [
+                profile.name,
+                profile.age,
+                profile.gender,
+                profile.city,
+                profile.description,
+                profile.interests,
+            ]
+            profile.completeness = (sum(1 for value in filled_fields if value) + (1 if approved_count else 0)) / 7
+        db.commit()
+    db.close()
+    return RedirectResponse(url="/moderation/photos", status_code=303)
 
 
 @app.post("/users/{user_id}/ban")

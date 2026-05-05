@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Модерация фото - Admin Panel</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        nav a { margin-right: 20px; text-decoration: none; color: #007bff; }
+        table { width: 100%; background: white; border-radius: 8px; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }
+        th { background: #f9f9f9; }
+        .avatar { width: 160px; height: 160px; object-fit: cover; border-radius: 6px; background: #eee; display: block; }
+        .approve-btn { background: #28a745; color: white; }
+        .reject-btn { background: #dc3545; color: white; }
+        button { padding: 8px 12px; border: none; border-radius: 4px; cursor: pointer; margin-right: 8px; }
+        .empty { background: white; padding: 24px; border-radius: 8px; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛠 Модерация фото</h1>
+            <nav>
+                <a href="/">Статистика</a>
+                <a href="/users">Пользователи</a>
+                <a href="/moderation/photos">Модерация фото</a>
+                <a href="/stats">Подробная статистика</a>
+            </nav>
+        </div>
+
+        {% if photos %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Фото</th>
+                    <th>Пользователь</th>
+                    <th>Анкета</th>
+                    <th>Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for photo, user, profile in photos %}
+                <tr>
+                    <td><img class="avatar" src="/photos/{{ photo.id }}" alt="Фото на проверке"></td>
+                    <td>
+                        ID: {{ user.id }}<br>
+                        Telegram: {{ user.telegram_id }}<br>
+                        Username: {{ user.username or "—" }}
+                    </td>
+                    <td>
+                        Имя: {{ profile.name or "—" }}<br>
+                        Возраст: {{ profile.age or "—" }}<br>
+                        Город: {{ profile.city or "—" }}<br>
+                        О себе: {{ profile.description or "—" }}
+                    </td>
+                    <td>
+                        <form method="post" action="/moderation/photos/{{ photo.id }}/approve" style="display:inline">
+                            <button type="submit" class="approve-btn">Одобрить</button>
+                        </form>
+                        <form method="post" action="/moderation/photos/{{ photo.id }}/reject" style="display:inline">
+                            <button type="submit" class="reject-btn">Отклонить</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty">Очередь пуста. Новых фото на проверке нет.</div>
+        {% endif %}
+    </div>
+</body>
+</html>
