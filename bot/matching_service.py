@@ -182,7 +182,7 @@ class MatchingService:
         excluded_ids = {current_user.id}
 
         try:
-            excluded_ids.update(await self.surreal.get_interacted_users(current_user.id))
+            excluded_ids.update(await self.surreal.get_excluded_users(current_user.id))
         except Exception as exc:
             logger.warning(
                 "surreal_interactions_read_failed",
@@ -192,7 +192,8 @@ class MatchingService:
 
         interactions_result = await self.session.execute(
             select(Interaction.to_user_id).where(
-                Interaction.from_user_id == current_user.id
+                Interaction.from_user_id == current_user.id,
+                Interaction.action.in_(["like", "skip"]),
             )
         )
         excluded_ids.update(interactions_result.scalars().all())
@@ -243,7 +244,7 @@ class MatchingService:
             if preference.max_age:
                 query = query.where(Profile.age <= preference.max_age)
             if preference.preferred_city:
-                query = query.where(Profile.city == preference.preferred_city)
+                query = query.where(Profile.city.ilike(preference.preferred_city))
 
         result = await self.session.execute(
             query.order_by(Rating.combined_score.desc()).limit(10)

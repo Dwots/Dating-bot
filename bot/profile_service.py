@@ -145,11 +145,22 @@ class ProfileService:
         )
         return result.scalar_one_or_none()
 
+    async def get_approved_photos(self, user_id: int) -> list[Photo]:
+        result = await self.session.execute(
+            select(Photo)
+            .where(
+                Photo.user_id == user_id,
+                Photo.status == ModerationStatus.APPROVED,
+            )
+            .order_by(Photo.is_primary.desc(), Photo.created_at.asc(), Photo.id.asc())
+        )
+        return list(result.scalars().all())
+
     async def get_user_photos(self, user_id: int) -> list[Photo]:
         result = await self.session.execute(
             select(Photo)
             .where(Photo.user_id == user_id)
-            .order_by(Photo.is_primary.desc(), Photo.created_at.asc(), Photo.id.asc())
+            .order_by(Photo.created_at.asc(), Photo.id.asc())
         )
         return list(result.scalars().all())
 
@@ -162,7 +173,12 @@ class ProfileService:
         )
         return approved_count, pending_count
 
-    async def add_pending_photo(self, user_id: int, s3_key: str) -> tuple[bool, list[Photo]]:
+    async def add_pending_photo(
+        self,
+        user_id: int,
+        s3_key: str,
+        telegram_file_id: str | None = None,
+    ) -> tuple[bool, list[Photo]]:
         await self.session.execute(
             text("SELECT pg_advisory_xact_lock(:lock_id)"),
             {"lock_id": user_id},
@@ -175,13 +191,14 @@ class ProfileService:
             if getattr(photo.status, "value", photo.status) != "rejected"
         )
         if active_photos_count >= self.MAX_ACTIVE_PHOTOS:
-            await self.session.rollback()
+            await self.session.commit()
             return False, photos
 
         self.session.add(
             Photo(
                 user_id=user_id,
                 s3_key=s3_key,
+                telegram_file_id=telegram_file_id,
                 status=ModerationStatus.PENDING,
                 is_primary=False,
             )
@@ -204,7 +221,7 @@ class ProfileService:
         photo = result.scalar_one_or_none()
         if not photo:
             photos = await self.get_user_photos(user_id)
-            await self.session.rollback()
+            await self.session.commit()
             return False, None, photos
 
         was_primary = bool(photo.is_primary)
@@ -230,6 +247,33 @@ class ProfileService:
         photos = await self.get_user_photos(user_id)
         await self.session.commit()
         return True, s3_key, photos
+
+    async def set_primary_photo(self, user_id: int, photo_id: int) -> tuple[bool, list[Photo]]:
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": user_id},
+        )
+
+        result = await self.session.execute(
+            select(Photo).where(
+                Photo.id == photo_id,
+                Photo.user_id == user_id,
+                Photo.status == ModerationStatus.APPROVED,
+            )
+        )
+        photo = result.scalar_one_or_none()
+        if not photo:
+            photos = await self.get_user_photos(user_id)
+            await self.session.commit()
+            return False, photos
+
+        await self.session.execute(
+            update(Photo).where(Photo.user_id == user_id).values(is_primary=False)
+        )
+        photo.is_primary = True
+        await self.session.commit()
+        photos = await self.get_user_photos(user_id)
+        return True, photos
 
     async def update_photo_stats(self, user_id: int) -> list[Photo]:
         result = await self.session.execute(

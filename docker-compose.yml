@@ -71,14 +71,17 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:latest
     container_name: dating_surreal
+    user: root
     # --user, --pass — логин/пароль
     # --bind — на каком адресе слушать
-    # memory — хранить данные в памяти (для прода нужен file:// или tikv://)
-    command: start --user root --pass root --bind 0.0.0.0:8000 memory
+    # surrealkv:// хранит графовые данные на диске внутри Docker volume
+    command: start --user root --pass root --bind 0.0.0.0:8000 surrealkv:///data/database
     ports:
       - "8000:8000"
+    volumes:
+      - surreal_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "ws://localhost:8000"]
       interval: 10s
       timeout: 10s
       retries: 5
@@ -88,6 +91,9 @@ services:
       context: ./bot
       dockerfile: Dockerfile
     container_name: dating_bot
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
@@ -129,6 +135,9 @@ services:
       context: ./workers
       dockerfile: Dockerfile
     container_name: dating_celery_worker
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
@@ -158,6 +167,9 @@ services:
       context: ./workers
       dockerfile: Dockerfile
     container_name: dating_celery_beat
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
@@ -181,6 +193,9 @@ services:
       context: ./workers
       dockerfile: Dockerfile
     container_name: dating_match_consumer
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
@@ -219,6 +234,9 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: dating_grafana
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     ports:
       - "3000:3000"
     environment:
@@ -270,5 +288,6 @@ volumes:
   redis_data:
   rabbitmq_data:
   minio_data:
+  surreal_data:
   prometheus_data:
   grafana_data:

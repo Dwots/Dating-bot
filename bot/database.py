@@ -44,7 +44,10 @@ class Profile(Base):
     interests = Column(Text, nullable=True)
     photo_count = Column(Integer, default=0)
     completeness = Column(Float, default=0.0)
-    moderation_status = Column(SQLEnum(ModerationStatus), default=ModerationStatus.PENDING)
+    moderation_status = Column(
+        SQLEnum(ModerationStatus, native_enum=False),
+        default=ModerationStatus.PENDING,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -104,6 +107,10 @@ class Database:
                 ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
             """))
             await conn.execute(text("""
+                ALTER TABLE photos
+                ADD COLUMN IF NOT EXISTS telegram_file_id VARCHAR(255)
+            """))
+            await conn.execute(text("""
                 UPDATE photos
                 SET status = 'APPROVED'
                 WHERE status IS NULL OR status = 'approved'
@@ -142,6 +149,11 @@ class Photo(Base):
     # s3_key — путь к файлу в MinIO, например "photos/123456/abc.jpg"
     # по нему мы потом достаём файл обратно
     s3_key = Column(String(500), nullable=False)
-    status = Column(SQLEnum(ModerationStatus), default=ModerationStatus.PENDING, nullable=False)
+    telegram_file_id = Column(String(255), nullable=True)
+    status = Column(
+        SQLEnum(ModerationStatus, native_enum=False),
+        default=ModerationStatus.PENDING,
+        nullable=False,
+    )
     is_primary = Column(Boolean, default=False)  # главное фото профиля
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -64,32 +64,30 @@ class SurrealClient:
         await self.db.query(query)
         logger.debug(f"Graph edge created: {from_user_id} -{action}-> {to_user_id}")
 
-    async def get_interacted_users(self, user_id: int) -> set[int]:
+    async def get_excluded_users(self, user_id: int) -> set[int]:
         """
-        Возвращает все user_id с которыми пользователь взаимодействовал
-        (просмотрел, лайкнул, пропустил)
+        Возвращает user_id, которых больше не надо показывать в поиске:
+        лайкнутых и пропущенных. Простые просмотры не исключаются.
         
         -> — оператор обхода графа в SurrealDB
         ->liked->user   означает "пройди по рёбрам liked и достань целевые узлы user"
-        ->viewed->user  аналогично
         ->skipped->user аналогично
         """
         query = f"""
         SELECT 
             ->liked->user AS liked,
-            ->viewed->user AS viewed,
             ->skipped->user AS skipped
         FROM user:{user_id}
         """
         result = await self.db.query(query)
 
-        # Результат SurrealDB: [{"result": [{"liked": [...], "viewed": [...], "skipped": [...]}]}]
+        # Результат SurrealDB: [{"result": [{"liked": [...], "skipped": [...]}]}]
         interacted = set()
 
         if result and len(result) > 0 and "result" in result[0]:
             data = result[0]["result"]
             if len(data) > 0:
-                for key in ["liked", "viewed", "skipped"]:
+                for key in ["liked", "skipped"]:
                     if key in data[0] and data[0][key]:
                         for user in data[0][key]:
                             # user выглядит как "user:123"
@@ -99,6 +97,9 @@ class SurrealClient:
                                 interacted.add(uid)
 
         return interacted
+
+    async def get_interacted_users(self, user_id: int) -> set[int]:
+        return await self.get_excluded_users(user_id)
 
     async def check_mutual_like(self, user1_id: int, user2_id: int) -> bool:
         """

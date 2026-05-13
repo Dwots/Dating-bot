@@ -14,8 +14,31 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 def profile_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📷 Фотографии", callback_data="profile_photos")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
     ])
+
+
+def profile_photos_kb(photo_count: int, index: int) -> InlineKeyboardMarkup:
+    buttons = []
+    if photo_count > 1:
+        buttons.append([
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"profile_photo_{(index - 1) % photo_count}",
+            ),
+            InlineKeyboardButton(
+                text=f"{index + 1}/{photo_count}",
+                callback_data="noop",
+            ),
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"profile_photo_{(index + 1) % photo_count}",
+            ),
+        ])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ К анкете", callback_data="my_profile")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 
@@ -37,19 +60,35 @@ def search_gender_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def view_profile_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❤️ Лайк", callback_data="like"),
-            InlineKeyboardButton(text="👎 Пропустить", callback_data="skip"),
-        ],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")],
+def view_profile_kb(photo_count: int = 0, photo_index: int = 0) -> InlineKeyboardMarkup:
+    buttons = []
+    if photo_count > 1:
+        buttons.append([
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"view_photo_{(photo_index - 1) % photo_count}",
+            ),
+            InlineKeyboardButton(
+                text=f"{photo_index + 1}/{photo_count}",
+                callback_data="noop",
+            ),
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"view_photo_{(photo_index + 1) % photo_count}",
+            ),
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(text="❤️ Лайк", callback_data="like"),
+        InlineKeyboardButton(text="👎 Пропустить", callback_data="skip"),
     ])
+    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def back_kb() -> InlineKeyboardMarkup:
+def back_kb(callback_data: str = "back") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data)],
     ])
 
 
@@ -58,10 +97,19 @@ def photo_management_kb(photos) -> InlineKeyboardMarkup:
     for index, photo in enumerate(photos, 1):
         status_value = getattr(getattr(photo, "status", None), "value", getattr(photo, "status", ""))
         status_icon = "✅" if status_value == "approved" else "⏳" if status_value == "pending" else "❌"
-        label = f"{status_icon} Удалить фото {index}"
+        label = f"{status_icon} Удалить {index}"
         if photo.is_primary and status_value == "approved":
             label += " ⭐"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"delete_photo_{photo.id}")])
+
+        row = [InlineKeyboardButton(text=label, callback_data=f"delete_photo_{photo.id}")]
+        if status_value == "approved" and not photo.is_primary:
+            row.append(
+                InlineKeyboardButton(
+                    text=f"⭐ Главное {index}",
+                    callback_data=f"set_primary_photo_{photo.id}",
+                )
+            )
+        buttons.append(row)
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="edit_profile")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)

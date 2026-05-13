@@ -4,6 +4,7 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramNetworkError
 from sqlalchemy.ext.asyncio import AsyncSession
 from rabbitmq import RabbitMQClient
 from minio_client import MinioClient
@@ -16,15 +17,17 @@ import time
 logger = setup_logging("handlers")
 
 from database import User, Gender
+from database import Photo
 from matching_service import MatchingService
 from profile_service import ProfileService
 from keyboards import (
     main_menu_kb, profile_menu_kb, edit_profile_kb, gender_kb,
     search_gender_kb, view_profile_kb, back_kb, search_settings_kb,
-    photo_management_kb, matches_kb
+    photo_management_kb, matches_kb, profile_photos_kb
 )
 
 router = Router()
+PHOTO_UPLOAD_LOCKS: dict[int, asyncio.Lock] = {}
 
 
 # ─── FSM состояния ────────────────────────────────────────────────────────────
@@ -70,6 +73,35 @@ def format_telegram_contact(user: User | None) -> str:
     return "тег не указан"
 
 
+async def get_photo_input(photo: Photo, minio: MinioClient):
+    if photo.telegram_file_id:
+        return photo.telegram_file_id
+
+    loop = asyncio.get_event_loop()
+    photo_bytes = await loop.run_in_executor(
+        None, minio.get_photo_bytes, photo.s3_key
+    )
+    return BufferedInputFile(photo_bytes, filename="photo.jpg")
+
+
+def get_photo_upload_lock(user_id: int) -> asyncio.Lock:
+    lock = PHOTO_UPLOAD_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        PHOTO_UPLOAD_LOCKS[user_id] = lock
+    return lock
+
+
+async def clear_profile_search_cache(
+    telegram_id: int,
+    session: AsyncSession,
+    redis: aioredis.Redis,
+):
+    current_user = await ProfileService(session).get_user_by_telegram_id(telegram_id)
+    if current_user:
+        await redis.delete(f"{MatchingService.CACHE_PREFIX}:{current_user.id}")
+
+
 # ─── /start — с поддержкой реферальной ссылки ────────────────────────────────
 
 @router.message(CommandStart())
@@ -113,10 +145,15 @@ async def show_main_menu(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
+    await callback.answer()
+
+
 # ─── Профиль ──────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "my_profile")
-async def show_profile(callback: CallbackQuery, session: AsyncSession, minio: MinioClient):
+async def show_profile(callback: CallbackQuery, session: AsyncSession):
     profile_service = ProfileService(session)
     profile = await profile_service.get_profile_by_telegram_id(callback.from_user.id)
 
@@ -135,30 +172,72 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession, minio: Mi
     else:
         text = "Анкета не найдена. Начни с /start"
 
-    if profile:
-        primary_photo = await profile_service.get_primary_photo(profile.user_id)
-
-        if primary_photo:
-            loop = asyncio.get_event_loop()
-            photo_bytes = await loop.run_in_executor(
-                None, minio.get_photo_bytes, primary_photo.s3_key
-            )
-            photo_file = BufferedInputFile(photo_bytes, filename="profile.jpg")
-
-            try:
-                await callback.message.delete()
-            except Exception:
-                pass
-
-            await callback.message.answer_photo(
-                photo=photo_file,
-                caption=text,
-                reply_markup=profile_menu_kb(),
-            )
-            await callback.answer()
-            return
-
     await replace_message_text(callback, text, profile_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_photos")
+async def show_profile_photos(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    minio: MinioClient,
+):
+    await show_profile_photo(callback, session, minio, 0)
+
+
+@router.callback_query(F.data.startswith("profile_photo_"))
+async def paginate_profile_photos(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    minio: MinioClient,
+):
+    try:
+        index = int(callback.data.replace("profile_photo_", ""))
+    except ValueError:
+        await callback.answer("Некорректное фото", show_alert=True)
+        return
+
+    await show_profile_photo(callback, session, minio, index)
+
+
+async def show_profile_photo(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    minio: MinioClient,
+    index: int,
+):
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
+    if not current_user:
+        await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
+        return
+
+    photos = await profile_service.get_approved_photos(current_user.id)
+    if not photos:
+        await replace_message_text(
+            callback,
+            "📷 У тебя пока нет одобренных фото.\n\n"
+            "Загрузи фото в редактировании анкеты и дождись проверки.",
+            profile_menu_kb(),
+        )
+        await callback.answer()
+        return
+
+    index = index % len(photos)
+    photo = photos[index]
+    photo_input = await get_photo_input(photo, minio)
+    caption = f"📷 Фото {index + 1}/{len(photos)}"
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await callback.message.answer_photo(
+        photo=photo_input,
+        caption=caption,
+        reply_markup=profile_photos_kb(len(photos), index),
+    )
     await callback.answer()
 
 
@@ -176,7 +255,7 @@ async def edit_profile_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "edit_name")
 async def edit_name(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileForm.name)
-    await callback.message.edit_text("Введи своё имя:", reply_markup=back_kb())
+    await callback.message.edit_text("Введи своё имя:", reply_markup=back_kb("edit_profile"))
     await callback.answer()
 
 
@@ -188,13 +267,13 @@ async def process_name(message: Message, state: FSMContext, session: AsyncSessio
         message.text,
     )
     await state.clear()
-    await message.answer("✅ Имя сохранено!", reply_markup=main_menu_kb())
+    await message.answer("✅ Имя сохранено. Что изменить дальше?", reply_markup=edit_profile_kb())
 
 
 @router.callback_query(F.data == "edit_age")
 async def edit_age(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileForm.age)
-    await callback.message.edit_text("Введи свой возраст (18-100):", reply_markup=back_kb())
+    await callback.message.edit_text("Введи свой возраст (18-100):", reply_markup=back_kb("edit_profile"))
     await callback.answer()
 
 
@@ -209,7 +288,7 @@ async def process_age(message: Message, state: FSMContext, session: AsyncSession
                 age,
             )
             await state.clear()
-            await message.answer("✅ Возраст сохранён!", reply_markup=main_menu_kb())
+            await message.answer("✅ Возраст сохранён. Что изменить дальше?", reply_markup=edit_profile_kb())
         else:
             await message.answer("❌ Возраст должен быть от 18 до 100")
     except ValueError:
@@ -230,14 +309,14 @@ async def process_gender(callback: CallbackQuery, session: AsyncSession):
         "gender",
         gender,
     )
-    await callback.message.edit_text("✅ Пол сохранён!", reply_markup=main_menu_kb())
+    await callback.message.edit_text("✅ Пол сохранён. Что изменить дальше?", reply_markup=edit_profile_kb())
     await callback.answer()
 
 
 @router.callback_query(F.data == "edit_city")
 async def edit_city(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileForm.city)
-    await callback.message.edit_text("Введи свой город:", reply_markup=back_kb())
+    await callback.message.edit_text("Введи свой город:", reply_markup=back_kb("edit_profile"))
     await callback.answer()
 
 
@@ -249,13 +328,13 @@ async def process_city(message: Message, state: FSMContext, session: AsyncSessio
         message.text,
     )
     await state.clear()
-    await message.answer("✅ Город сохранён!", reply_markup=main_menu_kb())
+    await message.answer("✅ Город сохранён. Что изменить дальше?", reply_markup=edit_profile_kb())
 
 
 @router.callback_query(F.data == "edit_description")
 async def edit_description(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileForm.description)
-    await callback.message.edit_text("Расскажи о себе:", reply_markup=back_kb())
+    await callback.message.edit_text("Расскажи о себе:", reply_markup=back_kb("edit_profile"))
     await callback.answer()
 
 
@@ -267,13 +346,13 @@ async def process_description(message: Message, state: FSMContext, session: Asyn
         message.text,
     )
     await state.clear()
-    await message.answer("✅ Описание сохранено!", reply_markup=main_menu_kb())
+    await message.answer("✅ Описание сохранено. Что изменить дальше?", reply_markup=edit_profile_kb())
 
 
 @router.callback_query(F.data == "edit_interests")
 async def edit_interests(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileForm.interests)
-    await callback.message.edit_text("Укажи свои интересы (через запятую):", reply_markup=back_kb())
+    await callback.message.edit_text("Укажи свои интересы (через запятую):", reply_markup=back_kb("edit_profile"))
     await callback.answer()
 
 
@@ -285,7 +364,7 @@ async def process_interests(message: Message, state: FSMContext, session: AsyncS
         message.text,
     )
     await state.clear()
-    await message.answer("✅ Интересы сохранены!", reply_markup=main_menu_kb())
+    await message.answer("✅ Интересы сохранены. Что изменить дальше?", reply_markup=edit_profile_kb())
 
 
 # ─── Фото ─────────────────────────────────────────────────────────────────────
@@ -327,6 +406,18 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
         await state.clear()
         return
 
+    async with get_photo_upload_lock(current_user.id):
+        await process_photo_upload(message, session, minio, current_user, profile_service)
+
+
+async def process_photo_upload(
+    message: Message,
+    session: AsyncSession,
+    minio: MinioClient,
+    current_user: User,
+    profile_service: ProfileService,
+):
+
     existing_photos = await profile_service.get_user_photos(current_user.id)
     active_photos_count = sum(
         1
@@ -341,27 +432,59 @@ async def process_photo(message: Message, state: FSMContext, session: AsyncSessi
         )
         return
 
-    # Скачиваем фото из Telegram
-    # message.photo[-1] — наибольшее разрешение
     photo = message.photo[-1]
-    file = await message.bot.get_file(photo.file_id)
+    try:
+        file = await message.bot.get_file(photo.file_id)
+        file_bytes_io = await message.bot.download_file(file.file_path)
+        file_bytes = file_bytes_io.read()
+    except TelegramNetworkError as exc:
+        logger.warning(
+            "telegram_photo_download_failed",
+            user_id=current_user.id,
+            error=str(exc),
+        )
+        await message.answer(
+            "❌ Не удалось скачать фото из Telegram. Попробуй отправить его ещё раз.",
+            reply_markup=photo_management_kb(existing_photos),
+        )
+        return
 
-    # download возвращает BytesIO объект
-    file_bytes_io = await message.bot.download_file(file.file_path)
-    file_bytes = file_bytes_io.read()
-
-    # Загружаем в MinIO — получаем s3_key
-    # boto3 синхронный, запускаем в executor чтобы не блокировать event loop
     loop = asyncio.get_event_loop()
-    s3_key = await loop.run_in_executor(
-        None,  # None = использовать ThreadPoolExecutor по умолчанию
-        minio.upload_photo,
-        file_bytes,
-        current_user.telegram_id
-    )
+    try:
+        s3_key = await loop.run_in_executor(
+            None,
+            minio.upload_photo,
+            file_bytes,
+            current_user.telegram_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "minio_photo_upload_failed",
+            user_id=current_user.id,
+            error=str(exc),
+        )
+        await message.answer(
+            "❌ Не удалось сохранить фото. Попробуй отправить его ещё раз.",
+            reply_markup=photo_management_kb(existing_photos),
+        )
+        return
 
-    added, photos = await profile_service.add_pending_photo(current_user.id, s3_key)
+    added, photos = await profile_service.add_pending_photo(
+        current_user.id,
+        s3_key,
+        photo.file_id,
+    )
     if not added:
+        try:
+            await loop.run_in_executor(None, minio.delete_photo, s3_key)
+        except Exception as exc:
+            logger.warning(
+                "minio_orphan_photo_delete_failed",
+                user_id=current_user.id,
+                s3_key=s3_key,
+                error=str(exc),
+            )
+
         await message.answer(
             "❌ Максимум 5 фото. Удали старое чтобы добавить новое.",
             reply_markup=photo_management_kb(photos),
@@ -430,6 +553,51 @@ async def delete_photo(
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("set_primary_photo_"))
+async def set_primary_photo(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+):
+    await state.set_state(ProfileForm.photo)
+
+    try:
+        photo_id = int(callback.data.replace("set_primary_photo_", ""))
+    except ValueError:
+        await callback.answer("Некорректное фото", show_alert=True)
+        return
+
+    profile_service = ProfileService(session)
+    current_user = await profile_service.get_user_by_telegram_id(callback.from_user.id)
+    if not current_user:
+        await callback.answer("Сначала зарегистрируйся с /start", show_alert=True)
+        return
+
+    updated, photos = await profile_service.set_primary_photo(current_user.id, photo_id)
+    approved_count, pending_count = profile_service.get_photo_counts(photos)
+    if not updated:
+        await replace_message_text(
+            callback,
+            "📷 Фото профиля\n\n"
+            f"Одобрено: {approved_count}/5\n"
+            f"На проверке: {pending_count}\n\n"
+            "Главным можно сделать только одобренное фото.",
+            photo_management_kb(photos),
+        )
+        await callback.answer("Фото недоступно", show_alert=True)
+        return
+
+    await replace_message_text(
+        callback,
+        "⭐ Главное фото обновлено.\n\n"
+        f"Одобрено: {approved_count}/5\n"
+        f"На проверке: {pending_count}\n\n"
+        "Именно оно будет первым показываться в анкете.",
+        photo_management_kb(photos),
+    )
+    await callback.answer()
+
+
 @router.message(ProfileForm.photo)
 async def process_photo_wrong(message: Message):
     """Если прислали не фото а что-то другое"""
@@ -475,7 +643,11 @@ async def edit_search_gender(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("search_"))
-async def process_search_gender(callback: CallbackQuery, session: AsyncSession):
+async def process_search_gender(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    redis: aioredis.Redis,
+):
     """
     callback.data: "search_male" / "search_female" / "search_all"
     """
@@ -495,6 +667,7 @@ async def process_search_gender(callback: CallbackQuery, session: AsyncSession):
         "preferred_gender",
         preferred_gender,
     )
+    await clear_profile_search_cache(callback.from_user.id, session, redis)
 
     await callback.message.edit_text("✅ Сохранено!", reply_markup=search_settings_kb())
     await callback.answer()
@@ -511,7 +684,12 @@ async def edit_min_age(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(PreferenceForm.min_age)
-async def process_min_age(message: Message, state: FSMContext, session: AsyncSession):
+async def process_min_age(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    redis: aioredis.Redis,
+):
     try:
         age = int(message.text)
         if 18 <= age <= 99:
@@ -520,6 +698,7 @@ async def process_min_age(message: Message, state: FSMContext, session: AsyncSes
                 "min_age",
                 age,
             )
+            await clear_profile_search_cache(message.from_user.id, session, redis)
             await state.clear()
             await message.answer("✅ Минимальный возраст сохранён!", reply_markup=main_menu_kb())
         else:
@@ -539,7 +718,12 @@ async def edit_max_age(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(PreferenceForm.max_age)
-async def process_max_age(message: Message, state: FSMContext, session: AsyncSession):
+async def process_max_age(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    redis: aioredis.Redis,
+):
     try:
         age = int(message.text)
         if 19 <= age <= 100:
@@ -548,6 +732,7 @@ async def process_max_age(message: Message, state: FSMContext, session: AsyncSes
                 "max_age",
                 age,
             )
+            await clear_profile_search_cache(message.from_user.id, session, redis)
             await state.clear()
             await message.answer("✅ Максимальный возраст сохранён!", reply_markup=main_menu_kb())
         else:
@@ -567,13 +752,20 @@ async def edit_search_city(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(PreferenceForm.city)
-async def process_search_city(message: Message, state: FSMContext, session: AsyncSession):
-    preferred_city = None if message.text.lower() == "любой" else message.text
+async def process_search_city(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    redis: aioredis.Redis,
+):
+    city_text = message.text.strip()
+    preferred_city = None if city_text.lower() == "любой" else city_text
     await ProfileService(session).update_preference_field(
         message.from_user.id,
         "preferred_city",
         preferred_city,
     )
+    await clear_profile_search_cache(message.from_user.id, session, redis)
     await state.clear()
     await message.answer("✅ Город поиска сохранён!", reply_markup=main_menu_kb())
 
@@ -650,10 +842,12 @@ async def view_profiles(
         await callback.answer()
         return
 
-    await matching_service.record_view(current_user.id, profile_data["user_id"])
-
-    await state.update_data(viewing_user_id=profile_data["user_id"])
-    await _show_profile(callback, session, minio, profile_data)
+    await state.update_data(
+        viewing_user_id=profile_data["user_id"],
+        viewing_profile_data=profile_data,
+        viewing_photo_index=0,
+    )
+    await _show_profile(callback, session, minio, profile_data, 0)
     await callback.answer()
     
     # Записываем время выполнения
@@ -667,6 +861,7 @@ async def _show_profile(
     session: AsyncSession,
     minio: MinioClient,
     profile_data: dict,
+    photo_index: int = 0,
 ):
     """
     Показываем анкету пользователю.
@@ -687,29 +882,46 @@ async def _show_profile(
         f"💡 Интересы: {profile_data.get('interests') or 'Не указаны'}"
     )
 
-    # Ищем фото профиля
-    primary_photo = await ProfileService(session).get_primary_photo(
-        profile_data["user_id"]
-    )
+    photos = await ProfileService(session).get_approved_photos(profile_data["user_id"])
 
-    if primary_photo:
-        loop = asyncio.get_event_loop()
-        photo_bytes = await loop.run_in_executor(
-            None, minio.get_photo_bytes, primary_photo.s3_key
-        )
-        from aiogram.types import BufferedInputFile
-        photo_file = BufferedInputFile(photo_bytes, filename="photo.jpg")
+    if photos:
+        photo_index = photo_index % len(photos)
+        photo_input = await get_photo_input(photos[photo_index], minio)
         await callback.message.delete()
         await callback.message.answer_photo(
-            photo=photo_file,
+            photo=photo_input,
             caption=caption,
-            reply_markup=view_profile_kb()
+            reply_markup=view_profile_kb(len(photos), photo_index)
         )
     else:
         try:
             await callback.message.edit_text(caption, reply_markup=view_profile_kb())
         except Exception:
             await callback.message.answer(caption, reply_markup=view_profile_kb())
+
+
+@router.callback_query(F.data.startswith("view_photo_"))
+async def paginate_view_profile_photos(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+    minio: MinioClient,
+):
+    try:
+        photo_index = int(callback.data.replace("view_photo_", ""))
+    except ValueError:
+        await callback.answer("Некорректное фото", show_alert=True)
+        return
+
+    data = await state.get_data()
+    profile_data = data.get("viewing_profile_data")
+    if not profile_data:
+        await callback.answer("Анкета не найдена", show_alert=True)
+        return
+
+    await state.update_data(viewing_photo_index=photo_index)
+    await _show_profile(callback, session, minio, profile_data, photo_index)
+    await callback.answer()
             
 # ─── Лайк / Пропуск ───────────────────────────────────────────────────────────
 

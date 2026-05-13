@@ -31,7 +31,7 @@ def get_session() -> Session:
     return SessionLocal()
 
 
-# ─── Задача 1: Пересчёт рейтингов ─────────────────────────────────────────────
+# Пересчёт рейтингов 
 
 @app.task(name="tasks.recalculate_ratings")
 def recalculate_ratings():
@@ -111,7 +111,7 @@ def _calculate_user_rating(session: Session, user_id: int, user_row) -> dict:
     Считаем три уровня рейтинга для одного пользователя
     """
 
-    # ── Уровень 1: Первичный рейтинг ──────────────────────────────
+    # Первичный рейтинг 
 
     completeness = float(user_row.completeness or 0)
     photo_count = int(user_row.photo_count or 0)
@@ -125,7 +125,7 @@ def _calculate_user_rating(session: Session, user_id: int, user_row) -> dict:
         0.3                    # базовый балл
     )
 
-    # ── Уровень 2: Поведенческий рейтинг ──────────────────────────
+    # Поведенческий рейтинг 
 
     # Считаем лайки и пропуски полученные этим пользователем
     interactions = session.execute(text("""
@@ -173,7 +173,7 @@ def _calculate_user_rating(session: Session, user_id: int, user_row) -> dict:
         activity_bonus * 0.30
     )
 
-    # ── Уровень 3: Комбинированный рейтинг ────────────────────────
+    # Комбинированный рейтинг 
 
     # Считаем сколько друзей пригласил пользователь
     referrals_count = session.execute(text("""
@@ -201,7 +201,7 @@ def _calculate_user_rating(session: Session, user_id: int, user_row) -> dict:
     }
 
 
-# ─── Задача 2: Уведомление о матче ────────────────────────────────────────────
+# Уведомление о матче 
 
 @app.task(name="tasks.notify_match")
 def notify_match(user1_telegram_id: int, user2_telegram_id: int, user1_name: str):
